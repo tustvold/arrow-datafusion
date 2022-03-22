@@ -190,8 +190,14 @@ fn criterion_benchmark(c: &mut Criterion) {
         }
     };
 
-    assert!(Path::new(&file_path).exists(), "path not found");
+    assert!(Path::new(&file_path).exists(), "parquet file not found");
     println!("Using parquet file {}", file_path);
+
+    let queries_path = "benches/parquet_query_sql.sql";
+    assert!(
+        Path::new(queries_path).exists(),
+        "queries file not found, benchmark must be run from datafusion directory"
+    );
 
     let mut context = SessionContext::new();
 
@@ -200,7 +206,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         .unwrap();
 
     // We read the queries from a file so they can be changed without recompiling the benchmark
-    let mut queries_file = File::open("benches/parquet_query_sql.sql").unwrap();
+    let mut queries_file = File::open(queries_path).unwrap();
     let mut queries = String::new();
     queries_file.read_to_string(&mut queries).unwrap();
 
@@ -223,7 +229,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 rt.block_on(async move {
                     let query = context.sql(query).await.unwrap();
                     let mut stream = query.execute_stream().await.unwrap();
-                    while criterion::black_box(stream.next().await).is_some() {}
+                    while stream.next().await.transpose().unwrap().is_some() {}
                 })
             });
         });

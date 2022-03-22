@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{any::Any, convert::TryInto};
 
-use crate::datasource::object_store::{ChunkReader, ObjectStore, SizedFile};
+use crate::datasource::object_store::{ObjectStore, SizedFile};
 use crate::datasource::PartitionedFile;
 use crate::execution::context::{SessionState, TaskContext};
 use crate::physical_plan::expressions::PhysicalSortExpr;
@@ -63,10 +63,12 @@ use parquet::file::properties::WriterProperties;
 use tokio::task;
 use tokio::task::JoinHandle;
 
+use crate::datasource::file_format::parquet::ChunkObjectReader;
 use crate::physical_plan::RecordBatchStream;
 use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt};
 use parquet::arrow::async_reader::ParquetRecordBatchStream;
+use parquet::file::serialized_reader::ReadOptionsBuilder;
 
 /// Execution plan for scanning one or more Parquet partitions
 #[derive(Debug, Clone)]
@@ -288,8 +290,8 @@ struct PartitionConfig {
 
 enum StreamState {
     Init,
-    Create(BoxFuture<'static, Result<ParquetRecordBatchStream<Box<dyn ChunkReader>>>>),
-    Stream(ParquetRecordBatchStream<Box<dyn ChunkReader>>),
+    Create(BoxFuture<'static, Result<ParquetRecordBatchStream>>),
+    Stream(ParquetRecordBatchStream),
     Error,
 }
 
@@ -388,7 +390,7 @@ impl Stream for ParquetExecStream {
 /// Wraps parquet statistics in a way
 /// that implements [`PruningStatistics`]
 struct RowGroupPruningStatistics<'a> {
-    row_group_metadata: &'a [RowGroupMetaData],
+    row_group_metadata: &'a RowGroupMetaData,
     parquet_schema: &'a Schema,
 }
 
@@ -421,33 +423,26 @@ macro_rules! get_statistic {
 // Extract the min or max value calling `func` or `bytes_func` on the ParquetStatistics as appropriate
 macro_rules! get_min_max_values {
     ($self:expr, $column:expr, $func:ident, $bytes_func:ident) => {{
-        let (column_index, field) = if let Some((v, f)) = $self.parquet_schema.column_with_name(&$column.name) {
-            (v, f)
-        } else {
-            // Named column was not present
-            return None
-        };
+        let (column_index, field) =
+            if let Some((v, f)) = $self.parquet_schema.column_with_name(&$column.name) {
+                (v, f)
+            } else {
+                // Named column was not present
+                return None;
+            };
 
         let data_type = field.data_type();
         // The result may be None, because DataFusion doesn't have support for ScalarValues of the column type
         let null_scalar: ScalarValue = data_type.try_into().ok()?;
 
-        let scalar_values : Vec<ScalarValue> = $self.row_group_metadata
-            .iter()
-            .flat_map(|meta| {
-                meta.column(column_index).statistics()
-            })
-            .map(|stats| {
-                get_statistic!(stats, $func, $bytes_func)
-            })
-            .map(|maybe_scalar| {
-                // column either did't have statistics at all or didn't have min/max values
-                maybe_scalar.unwrap_or_else(|| null_scalar.clone())
-            })
-            .collect();
-
-        // ignore errors converting to arrays (e.g. different types)
-        ScalarValue::iter_to_array(scalar_values).ok()
+        $self.row_group_metadata
+            .column(column_index)
+            .statistics()
+            .map(|stats| get_statistic!(stats, $func, $bytes_func))
+            .flatten()
+            // column either didn't have statistics at all or didn't have min/max values
+            .or_else(|| Some(null_scalar.clone()))
+            .map(|s| s.to_array())
     }}
 }
 
@@ -462,17 +457,14 @@ macro_rules! get_null_count_values {
                 return None;
             };
 
-        let scalar_values: Vec<ScalarValue> = $self
-            .row_group_metadata
-            .iter()
-            .flat_map(|meta| meta.column(column_index).statistics())
-            .map(|stats| {
-                ScalarValue::UInt64(Some(stats.null_count().try_into().unwrap()))
-            })
-            .collect();
-
-        // ignore errors converting to arrays (e.g. different types)
-        ScalarValue::iter_to_array(scalar_values).ok()
+        let value = ScalarValue::UInt64(
+            $self
+                .row_group_metadata
+                .column(column_index)
+                .statistics()
+                .map(|s| s.null_count()),
+        );
+        Some(value.to_array())
     }};
 }
 
@@ -486,7 +478,7 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
     }
 
     fn num_containers(&self) -> usize {
-        self.row_group_metadata.len()
+        1
     }
 
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
@@ -494,46 +486,57 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
     }
 }
 
+fn build_row_group_predicate(
+    pruning_predicate: &PruningPredicate,
+    metrics: ParquetFileMetrics,
+) -> Box<dyn FnMut(&RowGroupMetaData, usize) -> bool + Send> {
+    let pruning_predicate = pruning_predicate.clone();
+    Box::new(
+        move |row_group_metadata: &RowGroupMetaData, _i: usize| -> bool {
+            let parquet_schema = pruning_predicate.schema().as_ref();
+            let pruning_stats = RowGroupPruningStatistics {
+                row_group_metadata,
+                parquet_schema,
+            };
+            let predicate_values = pruning_predicate.prune(&pruning_stats);
+            match predicate_values {
+                Ok(values) => {
+                    // NB: false means don't scan row group
+                    let num_pruned = values.iter().filter(|&v| !*v).count();
+                    metrics.row_groups_pruned.add(num_pruned);
+                    values[0]
+                }
+                // stats filter array could not be built
+                // return a closure which will not filter out any row groups
+                Err(e) => {
+                    debug!("Error evaluating row group predicate values {}", e);
+                    metrics.predicate_evaluation_errors.add(1);
+                    true
+                }
+            }
+        },
+    )
+}
+
 async fn create_stream(
     config: Arc<PartitionConfig>,
     file: SizedFile,
-) -> Result<ParquetRecordBatchStream<Box<dyn ChunkReader>>> {
-    let file_metrics =
-        ParquetFileMetrics::new(config.partition_idx, &file.path, &config.metrics);
-
-    let object_reader = config.object_store.file_reader(file)?;
-    let reader = object_reader.chunk_reader().await?;
-
-    let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-
-    let pruning_stats = RowGroupPruningStatistics {
-        row_group_metadata: builder.metadata().row_groups(),
-        parquet_schema: builder.schema().as_ref(),
-    };
+) -> Result<ParquetRecordBatchStream> {
+    let mut read_options = ReadOptionsBuilder::new();
 
     if let Some(predicate) = &config.pruning_predicate {
-        match predicate.prune(&pruning_stats) {
-            Ok(predicate_values) => {
-                let num_pruned = predicate_values.iter().filter(|&v| !*v).count();
-                file_metrics.row_groups_pruned.add(num_pruned);
-
-                let row_groups = predicate_values
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(idx, v)| match v {
-                        true => Some(idx),
-                        false => None,
-                    })
-                    .collect();
-
-                builder = builder.with_row_groups(row_groups)
-            }
-            Err(e) => {
-                debug!("Error evaluating row group predicate values {}", e);
-                file_metrics.predicate_evaluation_errors.add(1);
-            }
-        }
+        let file_metrics =
+            ParquetFileMetrics::new(config.partition_idx, &file.path, &config.metrics);
+        let predicate = build_row_group_predicate(predicate, file_metrics);
+        read_options = read_options.with_predicate(predicate);
     };
+
+    let object_reader = config.object_store.file_reader(file)?;
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+        ChunkObjectReader(object_reader),
+        read_options.build(),
+    )
+    .await?;
 
     let projection = config
         .schema_adapter
@@ -1079,6 +1082,11 @@ mod tests {
         Ok(())
     }
 
+    fn parquet_file_metrics() -> ParquetFileMetrics {
+        let metrics = Arc::new(ExecutionPlanMetricsSet::new());
+        ParquetFileMetrics::new(0, "file.parquet", &metrics)
+    }
+
     #[test]
     fn row_group_pruning_predicate_simple_expr() -> Result<()> {
         use datafusion_expr::{col, lit};
@@ -1097,12 +1105,13 @@ mod tests {
             vec![ParquetStatistics::int32(Some(11), Some(20), None, 0, false)],
         );
         let row_group_metadata = vec![rgm1, rgm2];
-        let row_group_stats = RowGroupPruningStatistics {
-            row_group_metadata: &row_group_metadata,
-            parquet_schema: pruning_predicate.schema().as_ref(),
-        };
-
-        let row_group_filter = pruning_predicate.prune(&row_group_stats).unwrap();
+        let mut row_group_predicate =
+            build_row_group_predicate(&pruning_predicate, parquet_file_metrics());
+        let row_group_filter = row_group_metadata
+            .iter()
+            .enumerate()
+            .map(|(i, g)| row_group_predicate(g, i))
+            .collect::<Vec<_>>();
         assert_eq!(row_group_filter, vec![false, true]);
 
         Ok(())
@@ -1126,12 +1135,13 @@ mod tests {
             vec![ParquetStatistics::int32(Some(11), Some(20), None, 0, false)],
         );
         let row_group_metadata = vec![rgm1, rgm2];
-        let row_group_stats = RowGroupPruningStatistics {
-            row_group_metadata: &row_group_metadata,
-            parquet_schema: pruning_predicate.schema().as_ref(),
-        };
-
-        let row_group_filter = pruning_predicate.prune(&row_group_stats).unwrap();
+        let mut row_group_predicate =
+            build_row_group_predicate(&pruning_predicate, parquet_file_metrics());
+        let row_group_filter = row_group_metadata
+            .iter()
+            .enumerate()
+            .map(|(i, g)| row_group_predicate(g, i))
+            .collect::<Vec<_>>();
         // missing statistics for first row group mean that the result from the predicate expression
         // is null / undefined so the first row group can't be filtered out
         assert_eq!(row_group_filter, vec![true, true]);
@@ -1170,12 +1180,13 @@ mod tests {
             ],
         );
         let row_group_metadata = vec![rgm1, rgm2];
-        let row_group_stats = RowGroupPruningStatistics {
-            row_group_metadata: &row_group_metadata,
-            parquet_schema: pruning_predicate.schema().as_ref(),
-        };
-
-        let row_group_filter = pruning_predicate.prune(&row_group_stats).unwrap();
+        let mut row_group_predicate =
+            build_row_group_predicate(&pruning_predicate, parquet_file_metrics());
+        let row_group_filter = row_group_metadata
+            .iter()
+            .enumerate()
+            .map(|(i, g)| row_group_predicate(g, i))
+            .collect::<Vec<_>>();
         // the first row group is still filtered out because the predicate expression can be partially evaluated
         // when conditions are joined using AND
         assert_eq!(row_group_filter, vec![false, true]);
@@ -1184,12 +1195,13 @@ mod tests {
         // this bypasses the entire predicate expression and no row groups are filtered out
         let expr = col("c1").gt(lit(15)).or(col("c2").modulus(lit(2)));
         let pruning_predicate = PruningPredicate::try_new(expr, schema)?;
-        let row_group_stats = RowGroupPruningStatistics {
-            row_group_metadata: &row_group_metadata,
-            parquet_schema: pruning_predicate.schema().as_ref(),
-        };
-
-        let row_group_filter = pruning_predicate.prune(&row_group_stats).unwrap();
+        let mut row_group_predicate =
+            build_row_group_predicate(&pruning_predicate, parquet_file_metrics());
+        let row_group_filter = row_group_metadata
+            .iter()
+            .enumerate()
+            .map(|(i, g)| row_group_predicate(g, i))
+            .collect::<Vec<_>>();
         assert_eq!(row_group_filter, vec![true, true]);
 
         Ok(())
@@ -1229,12 +1241,13 @@ mod tests {
         let pruning_predicate = PruningPredicate::try_new(expr, schema)?;
         let row_group_metadata = gen_row_group_meta_data_for_pruning_predicate();
 
-        let row_group_stats = RowGroupPruningStatistics {
-            row_group_metadata: &row_group_metadata,
-            parquet_schema: pruning_predicate.schema().as_ref(),
-        };
-
-        let row_group_filter = pruning_predicate.prune(&row_group_stats).unwrap();
+        let mut row_group_predicate =
+            build_row_group_predicate(&pruning_predicate, parquet_file_metrics());
+        let row_group_filter = row_group_metadata
+            .iter()
+            .enumerate()
+            .map(|(i, g)| row_group_predicate(g, i))
+            .collect::<Vec<_>>();
         // First row group was filtered out because it contains no null value on "c2".
         assert_eq!(row_group_filter, vec![false, true]);
 
