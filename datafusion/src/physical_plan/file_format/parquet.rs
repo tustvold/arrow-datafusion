@@ -63,6 +63,7 @@ use parquet::file::properties::WriterProperties;
 use tokio::task;
 use tokio::task::JoinHandle;
 
+use crate::physical_plan::stream::RecordBatchReceiverStream;
 use crate::physical_plan::RecordBatchStream;
 use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt};
@@ -232,14 +233,29 @@ impl ExecutionPlan for ParquetExec {
             metrics: self.metrics.clone(),
         });
 
-        Ok(Box::pin(ParquetExecStream {
+        let mut stream = ParquetExecStream {
             partition_column_projector,
             config,
             files,
             state: StreamState::Init,
             file_idx: 0,
             remaining_rows: self.base_config.limit.unwrap_or(usize::MAX),
-        }))
+        };
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            while let Some(r) = stream.next().await {
+                if sender.send(r).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(RecordBatchReceiverStream::create(
+            &self.projected_schema,
+            receiver,
+            handle,
+        ))
     }
 
     fn fmt_as(
