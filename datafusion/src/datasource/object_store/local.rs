@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
+use parquet::arrow::async_reader::{FileStorage, Storage};
 
 use crate::datasource::object_store::{
     ChunkReader, FileMeta, FileMetaStream, ListEntryStream, ObjectReader, ObjectStore,
@@ -73,9 +74,13 @@ impl LocalFileReader {
 #[async_trait]
 impl ObjectReader for LocalFileReader {
     async fn chunk_reader(&self) -> Result<Box<dyn ChunkReader>> {
+        unimplemented!()
+    }
+
+    async fn storage(&self) -> Result<Box<dyn Storage>> {
         let file = tokio::fs::File::open(&self.file.path).await?;
-        let file = tokio::io::BufReader::new(file);
-        Ok(Box::new(file))
+        let file = file.into_std().await;
+        Ok(Box::new(FileStorage::new(file)))
     }
 
     fn sync_chunk_reader(

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{any::Any, convert::TryInto};
 
-use crate::datasource::object_store::{ChunkReader, ObjectStore, SizedFile};
+use crate::datasource::object_store::{ObjectStore, SizedFile};
 use crate::datasource::PartitionedFile;
 use crate::execution::context::{SessionState, TaskContext};
 use crate::physical_plan::expressions::PhysicalSortExpr;
@@ -67,7 +67,7 @@ use crate::physical_plan::stream::RecordBatchReceiverStream;
 use crate::physical_plan::RecordBatchStream;
 use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt};
-use parquet::arrow::async_reader::ParquetRecordBatchStream;
+use parquet::arrow::async_reader::{ParquetRecordBatchStream, Storage};
 
 /// Execution plan for scanning one or more Parquet partitions
 #[derive(Debug, Clone)]
@@ -304,8 +304,8 @@ struct PartitionConfig {
 
 enum StreamState {
     Init,
-    Create(BoxFuture<'static, Result<ParquetRecordBatchStream<Box<dyn ChunkReader>>>>),
-    Stream(ParquetRecordBatchStream<Box<dyn ChunkReader>>),
+    Create(BoxFuture<'static, Result<ParquetRecordBatchStream<Box<dyn Storage>>>>),
+    Stream(ParquetRecordBatchStream<Box<dyn Storage>>),
     Error,
 }
 
@@ -513,14 +513,14 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
 async fn create_stream(
     config: Arc<PartitionConfig>,
     file: SizedFile,
-) -> Result<ParquetRecordBatchStream<Box<dyn ChunkReader>>> {
+) -> Result<ParquetRecordBatchStream<Box<dyn Storage>>> {
     let file_metrics =
         ParquetFileMetrics::new(config.partition_idx, &file.path, &config.metrics);
 
     let object_reader = config.object_store.file_reader(file)?;
-    let reader = object_reader.chunk_reader().await?;
+    let storage = object_reader.storage().await?;
 
-    let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+    let mut builder = ParquetRecordBatchStreamBuilder::new(storage).await?;
 
     let pruning_stats = RowGroupPruningStatistics {
         row_group_metadata: builder.metadata().row_groups(),
@@ -559,6 +559,7 @@ async fn create_stream(
         .with_batch_size(config.batch_size)
         .with_projection(projection)
         .build()
+        .await
         .map_err(DataFusionError::ParquetError)
 }
 

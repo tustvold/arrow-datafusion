@@ -29,6 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
+use parquet::arrow::async_reader::Storage;
 use tokio::io::{AsyncBufRead, AsyncSeek};
 
 use local::LocalFileSystem;
@@ -64,6 +65,8 @@ pub trait ObjectReader: Send + Sync {
     /// Get a [`ChunkReader`] for the file, successive calls to this MUST
     /// return readers with independent seek positions
     async fn chunk_reader(&self) -> Result<Box<dyn ChunkReader>>;
+
+    async fn storage(&self) -> Result<Box<dyn Storage>>;
 
     /// Get reader for a part [start, start + length] in the file
     fn sync_chunk_reader(

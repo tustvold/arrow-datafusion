@@ -31,6 +31,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
+use parquet::arrow::async_reader::Storage;
 
 #[derive(Debug)]
 /// An object store implem that is useful for testing.
@@ -101,6 +102,10 @@ struct EmptyObjectReader(u64);
 #[async_trait]
 impl ObjectReader for EmptyObjectReader {
     async fn chunk_reader(&self) -> Result<Box<dyn ChunkReader>> {
+        unimplemented!()
+    }
+
+    async fn storage(&self) -> Result<Box<dyn Storage>> {
         unimplemented!()
     }
 

@@ -228,14 +228,14 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         let query = query.as_str();
         c.bench_function(query, |b| {
-            b.iter(|| {
+            b.to_async(&rt).iter(|| {
                 let mut context = context.clone();
-                rt.block_on(async move {
+                async move {
                     let query = context.sql(query).await.unwrap();
                     let mut stream = query.execute_stream().await.unwrap();
                     while stream.next().await.transpose().unwrap().is_some() {}
-                })
-            });
+                }
+            })
         });
     }
 
