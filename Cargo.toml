@@ -37,6 +37,6 @@ members = [
 codegen-units = 1
 
 [patch.crates-io]
-arrow = { path = "../arrow-rs/arrow" }
-arrow-flight = { path = "../arrow-rs/arrow-flight" }
-parquet = { path = "../arrow-rs/parquet" }
+arrow = { git = "https://github.com/tustvold/arrow-rs.git", rev = "b3e873a45cfca64605a39c366fd76b69964ef329", package = "arrow"}
+arrow-flight = { git = "https://github.com/tustvold/arrow-rs.git", rev = "b3e873a45cfca64605a39c366fd76b69964ef329", package = "arrow-flight"}
+parquet = { git = "https://github.com/tustvold/arrow-rs.git", rev = "b3e873a45cfca64605a39c366fd76b69964ef329", package = "parquet" }
