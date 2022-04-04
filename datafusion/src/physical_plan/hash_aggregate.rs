@@ -24,6 +24,7 @@ use std::vec;
 
 use ahash::RandomState;
 use futures::{
+    ready,
     stream::{Stream, StreamExt},
     Future,
 };
@@ -256,7 +257,7 @@ impl ExecutionPlan for HashAggregateExec {
                 self.aggr_expr.clone(),
                 input,
                 baseline_metrics,
-            )))
+            )?))
         }
     }
 
@@ -361,25 +362,130 @@ Example: average
 * Once all N record batches arrive, `merge` is performed, which builds a RecordBatch with N rows and 2 columns.
 * Finally, `get_value` returns an array with one entry computed from the state
 */
-pin_project! {
-    struct GroupedHashAggregateStream {
+struct GroupedHashAggregateStream {
+    schema: SchemaRef,
+    input: SendableRecordBatchStream,
+    mode: AggregateMode,
+    accumulators: Accumulators,
+    aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
+
+    aggr_expr: Vec<Arc<dyn AggregateExpr>>,
+    group_expr: Vec<Arc<dyn PhysicalExpr>>,
+
+    baseline_metrics: BaselineMetrics,
+    random_state: RandomState,
+    finished: bool,
+}
+
+impl GroupedHashAggregateStream {
+    /// Create a new HashAggregateStream
+    pub fn new(
+        mode: AggregateMode,
         schema: SchemaRef,
-        #[pin]
-        output: futures::channel::oneshot::Receiver<ArrowResult<RecordBatch>>,
-        finished: bool,
-        drop_helper: AbortOnDropSingle<()>,
+        group_expr: Vec<Arc<dyn PhysicalExpr>>,
+        aggr_expr: Vec<Arc<dyn AggregateExpr>>,
+        input: SendableRecordBatchStream,
+        baseline_metrics: BaselineMetrics,
+    ) -> Result<Self> {
+        let timer = baseline_metrics.elapsed_compute().timer();
+
+        // The expressions to evaluate the batch, one vec of expressions per aggregation.
+        // Assume create_schema() always put group columns in front of aggr columns, we set
+        // col_idx_base to group expression count.
+        let aggregate_expressions =
+            aggregate_expressions(&aggr_expr, &mode, group_expr.len())?;
+
+        timer.done();
+
+        Ok(Self {
+            schema,
+            mode,
+            input,
+            aggr_expr,
+            group_expr,
+            baseline_metrics,
+            aggregate_expressions,
+            accumulators: Default::default(),
+            random_state: Default::default(),
+            finished: false,
+        })
     }
 }
 
+impl Stream for GroupedHashAggregateStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.finished {
+            return Poll::Ready(None);
+        }
+
+        let elapsed_compute = this.baseline_metrics.elapsed_compute();
+
+        loop {
+            let result = match ready!(this.input.poll_next_unpin(cx)) {
+                Some(Ok(batch)) => {
+                    let timer = elapsed_compute.timer();
+                    let result = group_aggregate_batch(
+                        &this.mode,
+                        &this.random_state,
+                        &this.group_expr,
+                        &this.aggr_expr,
+                        batch,
+                        &mut this.accumulators,
+                        &this.aggregate_expressions,
+                    );
+
+                    timer.done();
+
+                    match result {
+                        Ok(_) => continue,
+                        Err(e) => Err(ArrowError::ExternalError(Box::new(e))),
+                    }
+                }
+                Some(Err(e)) => Err(e),
+                None => {
+                    this.finished = true;
+                    let timer = this.baseline_metrics.elapsed_compute().timer();
+                    let result = create_batch_from_map(
+                        &this.mode,
+                        &this.accumulators,
+                        this.group_expr.len(),
+                        &this.schema,
+                    )
+                    .record_output(&this.baseline_metrics);
+
+                    timer.done();
+                    result
+                }
+            };
+
+            this.finished = true;
+            return Poll::Ready(Some(result));
+        }
+    }
+}
+
+impl RecordBatchStream for GroupedHashAggregateStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// TODO: Make this a member function of [`GroupedHashAggregateStream`]
 fn group_aggregate_batch(
     mode: &AggregateMode,
     random_state: &RandomState,
     group_expr: &[Arc<dyn PhysicalExpr>],
     aggr_expr: &[Arc<dyn AggregateExpr>],
     batch: RecordBatch,
-    mut accumulators: Accumulators,
+    accumulators: &mut Accumulators,
     aggregate_expressions: &[Vec<Arc<dyn PhysicalExpr>>],
-) -> Result<Accumulators> {
+) -> Result<()> {
     // evaluate the grouping expressions
     let group_values = evaluate(group_expr, &batch)?;
 
@@ -400,7 +506,7 @@ fn group_aggregate_batch(
     create_hashes(&group_values, random_state, &mut batch_hashes)?;
 
     for (row, hash) in batch_hashes.into_iter().enumerate() {
-        let Accumulators { map, group_states } = &mut accumulators;
+        let Accumulators { map, group_states } = accumulators;
 
         let entry = map.get_mut(hash, |(_hash, group_idx)| {
             // verify that a group that we are inserting with hash is
@@ -521,88 +627,7 @@ fn group_aggregate_batch(
                 })
         })?;
 
-    Ok(accumulators)
-}
-
-async fn compute_grouped_hash_aggregate(
-    mode: AggregateMode,
-    schema: SchemaRef,
-    group_expr: Vec<Arc<dyn PhysicalExpr>>,
-    aggr_expr: Vec<Arc<dyn AggregateExpr>>,
-    mut input: SendableRecordBatchStream,
-    elapsed_compute: metrics::Time,
-) -> ArrowResult<RecordBatch> {
-    let timer = elapsed_compute.timer();
-    // The expressions to evaluate the batch, one vec of expressions per aggregation.
-    // Assume create_schema() always put group columns in front of aggr columns, we set
-    // col_idx_base to group expression count.
-    let aggregate_expressions =
-        aggregate_expressions(&aggr_expr, &mode, group_expr.len())?;
-
-    let random_state = RandomState::new();
-
-    // iterate over all input batches and update the accumulators
-    let mut accumulators = Accumulators::default();
-    timer.done();
-    while let Some(batch) = input.next().await {
-        let batch = batch?;
-        let timer = elapsed_compute.timer();
-        accumulators = group_aggregate_batch(
-            &mode,
-            &random_state,
-            &group_expr,
-            &aggr_expr,
-            batch,
-            accumulators,
-            &aggregate_expressions,
-        )?;
-        timer.done();
-    }
-
-    let timer = elapsed_compute.timer();
-    let batch = create_batch_from_map(&mode, &accumulators, group_expr.len(), &schema);
-    timer.done();
-    batch
-}
-
-impl GroupedHashAggregateStream {
-    /// Create a new HashAggregateStream
-    pub fn new(
-        mode: AggregateMode,
-        schema: SchemaRef,
-        group_expr: Vec<Arc<dyn PhysicalExpr>>,
-        aggr_expr: Vec<Arc<dyn AggregateExpr>>,
-        input: SendableRecordBatchStream,
-        baseline_metrics: BaselineMetrics,
-    ) -> Self {
-        let (tx, rx) = futures::channel::oneshot::channel();
-
-        let schema_clone = schema.clone();
-        let elapsed_compute = baseline_metrics.elapsed_compute().clone();
-
-        let join_handle = tokio::spawn(async move {
-            let result = compute_grouped_hash_aggregate(
-                mode,
-                schema_clone,
-                group_expr,
-                aggr_expr,
-                input,
-                elapsed_compute,
-            )
-            .await
-            .record_output(&baseline_metrics);
-
-            // failing here is OK, the receiver is gone and does not care about the result
-            tx.send(result).ok();
-        });
-
-        Self {
-            schema,
-            output: rx,
-            finished: false,
-            drop_helper: AbortOnDropSingle::new(join_handle),
-        }
-    }
+    Ok(())
 }
 
 type AccumulatorItem = Box<dyn Accumulator>;
@@ -645,44 +670,6 @@ impl std::fmt::Debug for Accumulators {
             .field("map", &map_string)
             .field("group_states", &self.group_states)
             .finish()
-    }
-}
-
-impl Stream for GroupedHashAggregateStream {
-    type Item = ArrowResult<RecordBatch>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        if self.finished {
-            return Poll::Ready(None);
-        }
-
-        // is the output ready?
-        let this = self.project();
-        let output_poll = this.output.poll(cx);
-
-        match output_poll {
-            Poll::Ready(result) => {
-                *this.finished = true;
-
-                // check for error in receiving channel and unwrap actual result
-                let result = match result {
-                    Err(e) => Err(ArrowError::ExternalError(Box::new(e))), // error receiving
-                    Ok(result) => result,
-                };
-
-                Poll::Ready(Some(result))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl RecordBatchStream for GroupedHashAggregateStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
     }
 }
 
