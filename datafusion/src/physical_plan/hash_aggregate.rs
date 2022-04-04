@@ -26,7 +26,6 @@ use ahash::RandomState;
 use futures::{
     ready,
     stream::{Stream, StreamExt},
-    Future,
 };
 
 use crate::error::{DataFusionError, Result};
@@ -47,15 +46,13 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use hashbrown::raw::RawTable;
-use pin_project_lite::pin_project;
 
 use crate::execution::context::TaskContext;
 use async_trait::async_trait;
 
-use super::common::AbortOnDropSingle;
 use super::expressions::PhysicalSortExpr;
 use super::metrics::{
-    self, BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput,
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput,
 };
 use super::Statistics;
 use super::{expressions::Column, RecordBatchStream, SendableRecordBatchStream};
@@ -248,7 +245,7 @@ impl ExecutionPlan for HashAggregateExec {
                 self.aggr_expr.clone(),
                 input,
                 baseline_metrics,
-            )))
+            )?))
         } else {
             Ok(Box::pin(GroupedHashAggregateStream::new(
                 self.mode,
@@ -740,46 +737,15 @@ fn aggregate_expressions(
     }
 }
 
-pin_project! {
-    /// stream struct for hash aggregation
-    pub struct HashAggregateStream {
-        schema: SchemaRef,
-        #[pin]
-        output: futures::channel::oneshot::Receiver<ArrowResult<RecordBatch>>,
-        finished: bool,
-        drop_helper: AbortOnDropSingle<()>,
-    }
-}
-
-/// Special case aggregate with no groups
-async fn compute_hash_aggregate(
-    mode: AggregateMode,
+/// stream struct for hash aggregation
+pub struct HashAggregateStream {
     schema: SchemaRef,
-    aggr_expr: Vec<Arc<dyn AggregateExpr>>,
-    mut input: SendableRecordBatchStream,
-    elapsed_compute: metrics::Time,
-) -> ArrowResult<RecordBatch> {
-    let timer = elapsed_compute.timer();
-    let mut accumulators = create_accumulators(&aggr_expr)?;
-    let expressions = aggregate_expressions(&aggr_expr, &mode, 0)?;
-    let expressions = Arc::new(expressions);
-    timer.done();
-
-    // 1 for each batch, update / merge accumulators with the expressions' values
-    // future is ready when all batches are computed
-    while let Some(batch) = input.next().await {
-        let batch = batch?;
-        let timer = elapsed_compute.timer();
-        aggregate_batch(&mode, &batch, &mut accumulators, &expressions)?;
-        timer.done();
-    }
-
-    // 2. convert values to a record batch
-    let timer = elapsed_compute.timer();
-    let batch = finalize_aggregation(&accumulators, &mode)
-        .map(|columns| RecordBatch::try_new(schema.clone(), columns))?;
-    timer.done();
-    batch
+    mode: AggregateMode,
+    input: SendableRecordBatchStream,
+    baseline_metrics: BaselineMetrics,
+    aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
+    accumulators: Vec<AccumulatorItem>,
+    finished: bool,
 }
 
 impl HashAggregateStream {
@@ -790,35 +756,23 @@ impl HashAggregateStream {
         aggr_expr: Vec<Arc<dyn AggregateExpr>>,
         input: SendableRecordBatchStream,
         baseline_metrics: BaselineMetrics,
-    ) -> Self {
-        let (tx, rx) = futures::channel::oneshot::channel();
+    ) -> Result<Self> {
+        let aggregate_expressions = aggregate_expressions(&aggr_expr, &mode, 0)?;
+        let accumulators = create_accumulators(&aggr_expr)?;
 
-        let schema_clone = schema.clone();
-        let elapsed_compute = baseline_metrics.elapsed_compute().clone();
-        let join_handle = tokio::spawn(async move {
-            let result = compute_hash_aggregate(
-                mode,
-                schema_clone,
-                aggr_expr,
-                input,
-                elapsed_compute,
-            )
-            .await
-            .record_output(&baseline_metrics);
-
-            // failing here is OK, the receiver is gone and does not care about the result
-            tx.send(result).ok();
-        });
-
-        Self {
+        Ok(Self {
             schema,
-            output: rx,
+            mode,
+            input,
+            baseline_metrics,
+            aggregate_expressions,
+            accumulators,
             finished: false,
-            drop_helper: AbortOnDropSingle::new(join_handle),
-        }
+        })
     }
 }
 
+/// TODO: Make this a member function
 fn aggregate_batch(
     mode: &AggregateMode,
     batch: &RecordBatch,
@@ -855,30 +809,52 @@ impl Stream for HashAggregateStream {
     type Item = ArrowResult<RecordBatch>;
 
     fn poll_next(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        if self.finished {
+        let this = &mut *self;
+        if this.finished {
             return Poll::Ready(None);
         }
 
-        // is the output ready?
-        let this = self.project();
-        let output_poll = this.output.poll(cx);
+        let elapsed_compute = this.baseline_metrics.elapsed_compute();
 
-        match output_poll {
-            Poll::Ready(result) => {
-                *this.finished = true;
+        loop {
+            let result = match ready!(this.input.poll_next_unpin(cx)) {
+                Some(Ok(batch)) => {
+                    let timer = elapsed_compute.timer();
+                    let result = aggregate_batch(
+                        &this.mode,
+                        &batch,
+                        &mut this.accumulators,
+                        &this.aggregate_expressions,
+                    );
 
-                // check for error in receiving channel and unwrap actual result
-                let result = match result {
-                    Err(e) => Err(ArrowError::ExternalError(Box::new(e))), // error receiving
-                    Ok(result) => result,
-                };
+                    timer.done();
 
-                Poll::Ready(Some(result))
-            }
-            Poll::Pending => Poll::Pending,
+                    match result {
+                        Ok(_) => continue,
+                        Err(e) => Err(ArrowError::ExternalError(Box::new(e))),
+                    }
+                }
+                Some(Err(e)) => Err(e),
+                None => {
+                    this.finished = true;
+                    let timer = this.baseline_metrics.elapsed_compute().timer();
+                    let result = finalize_aggregation(&this.accumulators, &this.mode)
+                        .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+                        .and_then(|columns| {
+                            RecordBatch::try_new(this.schema.clone(), columns)
+                        })
+                        .record_output(&this.baseline_metrics);
+
+                    timer.done();
+                    result
+                }
+            };
+
+            this.finished = true;
+            return Poll::Ready(Some(result));
         }
     }
 }
