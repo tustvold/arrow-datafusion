@@ -26,7 +26,6 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use futures::stream::FuturesOrdered;
 
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
@@ -72,21 +71,15 @@ impl MemTable {
         let exec = t.scan(&None, &[], None).await?;
         let partition_count = exec.output_partitioning().partition_count();
 
-        let mut tasks = (0..partition_count)
-            .map(|part_i| {
-                let context1 = context.clone();
-                let exec = exec.clone();
-                async move {
-                    let stream = exec.execute(part_i, context1.clone()).await?;
-                    common::collect(stream).await
-                }
-            })
-            .collect::<FuturesOrdered<_>>();
-
-        let mut data: Vec<Vec<RecordBatch>> = Vec::with_capacity(tasks.len());
-        while let Some(result) = tasks.next().await {
-            data.push(result?);
-        }
+        let data = futures::future::try_join_all((0..partition_count).map(|part_i| {
+            let context1 = context.clone();
+            let exec = exec.clone();
+            async move {
+                let stream = exec.execute(part_i, context1.clone()).await?;
+                common::collect(stream).await
+            }
+        }))
+        .await?;
 
         let exec = MemoryExec::try_new(&data, schema.clone(), None)?;
 
