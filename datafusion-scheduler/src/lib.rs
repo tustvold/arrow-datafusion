@@ -15,41 +15,90 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::error::{ArrowError, Result as ArrowResult};
+use crate::query::{Query, WorkItem};
+use datafusion::arrow::error::Result as ArrowResult;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::stream::{BoxStream, StreamExt};
-use futures::TryStreamExt;
 use std::sync::Arc;
-use std::task::Waker;
+use std::thread::JoinHandle;
 
 mod node;
+mod query;
 
-pub struct Scheduler {}
+pub struct Scheduler {
+    worker: Worker,
+}
 
 impl Scheduler {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            worker: Worker::new(),
+        }
     }
 
-    pub fn schedule(
+    pub async fn schedule_plan(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         context: Arc<TaskContext>,
     ) -> Result<BoxStream<'static, ArrowResult<RecordBatch>>> {
-        Ok(futures::stream::once(async move {
-            let streams = futures::future::try_join_all(
-                (0..plan.output_partitioning().partition_count())
-                    .map(|x| plan.execute(x, context.clone())),
-            )
-            .await?;
+        let (query, receiver) = Query::new(plan, context).await?;
+        WorkItem::spawn_query(&self.worker.spawner, Arc::new(query));
+        Ok(receiver.boxed())
+    }
+}
 
-            Ok::<_, ArrowError>(futures::stream::select_all(streams).boxed())
-        })
-        .try_flatten()
-        .boxed())
+struct Worker {
+    spawner: Spawner,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    fn new() -> Self {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let spawner = Spawner { sender };
+
+        let handle = std::thread::spawn(move || {
+            for item in receiver {
+                match item {
+                    Some(item) => item.do_work(),
+                    None => break,
+                }
+            }
+        });
+
+        Self {
+            handle: Some(handle),
+            spawner,
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.spawner.shutdown();
+
+        let handle = self.handle.take().expect("already dropped");
+        handle.join().expect("worker panicked");
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Spawner {
+    sender: crossbeam_channel::Sender<Option<WorkItem>>,
+}
+
+impl Spawner {
+    fn shutdown(&self) {
+        println!("Worker Shutdown");
+        self.sender.send(None).expect("worker gone")
+    }
+
+    fn spawn(&self, item: WorkItem) {
+        println!("Spawning {:?}", item);
+        self.sender.send(Some(item)).expect("worker gone")
     }
 }
 
@@ -115,11 +164,10 @@ mod tests {
 
         let task = context.task_ctx();
 
-        let stream = futures::executor::block_on(async move {
-            let query = context.sql("SELECT distinct b FROM t where a > 100;").await.unwrap();
+        let stream = futures::executor::block_on(async {
+            let query = context.sql("SELECT * FROM t").await.unwrap();
             let plan = query.create_physical_plan().await.unwrap();
-
-            scheduler.schedule(plan, task).unwrap()
+            scheduler.schedule_plan(plan, task).await.unwrap()
         });
 
         let batches = futures::executor::block_on_stream(stream)

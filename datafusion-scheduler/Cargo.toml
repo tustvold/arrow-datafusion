@@ -39,6 +39,7 @@ datafusion = { path = "../datafusion", version = "7.0.0" }
 futures = "0.3"
 parking_lot = "0.12"
 async-trait = "0.1"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 rand = "0.8"

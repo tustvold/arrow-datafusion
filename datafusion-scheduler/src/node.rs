@@ -1,12 +1,12 @@
 use std::any::Any;
 use std::collections::VecDeque;
-use std::fmt::{Formatter, Pointer};
+use std::fmt::Formatter;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt, TryFutureExt};
 use parking_lot::Mutex;
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -20,12 +20,22 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 
-/// An [`ExecutionNode`] wraps an [`ExecutionPlan`] and converts it to a push-based API
+/// An [`ExecutionNode`] wraps a single node within an [`ExecutionPlan`] and
+/// converts it to a push-based API that can be orchestrated by a [`super::Scheduler`]
 ///
 /// This is hopefully a temporary hack, pending reworking the [`ExecutionPlan`] trait
 pub struct ExecutionNode {
+    inner: Arc<dyn ExecutionPlan>,
     inputs: Vec<Arc<Mutex<InputPartition>>>,
-    outputs: Vec<SendableRecordBatchStream>,
+    outputs: Vec<Mutex<SendableRecordBatchStream>>,
+}
+
+impl std::fmt::Debug for ExecutionNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionNode")
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 impl ExecutionNode {
@@ -35,41 +45,62 @@ impl ExecutionNode {
     ) -> Result<Self> {
         let children = plan.children();
         let mut inputs = Vec::new();
-        let mut proxies: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(children.len());
 
-        for child in children {
-            let count = child.output_partitioning().partition_count();
+        let proxied = if !children.is_empty() {
+            let mut proxies: Vec<Arc<dyn ExecutionPlan>> =
+                Vec::with_capacity(children.len());
+            for child in children {
+                let count = child.output_partitioning().partition_count();
 
-            let child_inputs = vec![Default::default(); count];
-            inputs.extend_from_slice(&child_inputs);
-            proxies.push(Arc::new(ProxyExecutionPlan {
-                inner: child,
-                inputs: child_inputs,
-            }));
-        }
+                let child_inputs = vec![Default::default(); count];
+                inputs.extend_from_slice(&child_inputs);
+                proxies.push(Arc::new(ProxyExecutionPlan {
+                    inner: child,
+                    inputs: child_inputs,
+                }));
+            }
 
-        let proxied = plan.with_new_children(proxies)?;
+            plan.with_new_children(proxies)?
+        } else {
+            plan.clone()
+        };
+
         let output_count = proxied.output_partitioning().partition_count();
 
         let outputs = futures::future::try_join_all(
-            (0..output_count).map(|x| proxied.execute(x, task_context.clone())),
+            (0..output_count)
+                .map(|x| proxied.execute(x, task_context.clone()).map_ok(Mutex::new)),
         )
         .await?;
 
-        Ok(Self { inputs, outputs })
+        Ok(Self {
+            inner: plan,
+            inputs,
+            outputs,
+        })
     }
 
-    /// Push a [`RecordBatch`] to the given partition
-    pub fn push(&mut self, input: RecordBatch, partition: usize) {
-        self.inputs[partition].lock().buffer.push_back(input)
+    /// Push a [`RecordBatch`] to the given input partition
+    pub fn push(&self, input: RecordBatch, partition: usize) {
+        let mut partition = self.inputs[partition].lock();
+
+        partition.buffer.push_back(input);
+        for waker in partition.wait_list.drain(..) {
+            waker.wake()
+        }
     }
 
-    /// Poll a partition, attempting to get its output
+    pub fn output_partitions(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Poll an output partition, attempting to get its output
     pub fn poll_partition(
-        &mut self,
+        &self,
+        cx: &mut Context<'_>,
         partition: usize,
-    ) -> Option<ArrowResult<RecordBatch>> {
-        todo!()
+    ) -> Poll<Option<ArrowResult<RecordBatch>>> {
+        self.outputs[partition].lock().poll_next_unpin(cx)
     }
 }
 
@@ -154,7 +185,7 @@ impl ExecutionPlan for ProxyExecutionPlan {
 
     fn with_new_children(
         &self,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> crate::Result<Arc<dyn ExecutionPlan>> {
         unimplemented!()
     }
