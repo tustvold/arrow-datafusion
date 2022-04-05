@@ -1,9 +1,12 @@
 use crate::node::ExecutionNode;
+use crate::repartition::RepartitionNode;
 use crate::{ArrowResult, Spawner};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use futures::channel::mpsc;
 use futures::task::ArcWake;
 use std::collections::VecDeque;
@@ -56,8 +59,6 @@ impl WorkItem {
 
         let query_node = &self.query.nodes[node];
         match query_node.node.poll_partition(&mut cx, partition) {
-            Poll::Pending => println!("Poll {:?}: Pending", self),
-            Poll::Ready(None) => println!("Poll {:?}: None", self),
             Poll::Ready(Some(Ok(batch))) => {
                 println!("Poll {:?}: Ok: {}", self, batch.num_rows());
                 match query_node.parent_idx {
@@ -83,7 +84,17 @@ impl WorkItem {
             Poll::Ready(Some(Err(e))) => {
                 println!("Poll {:?}: Error: {:?}", self, e);
                 let _ = self.query.output.unbounded_send(Err(e));
+                if let Some(idx) = query_node.parent_idx {
+                    self.query.nodes[idx].node.close(partition)
+                }
             }
+            Poll::Ready(None) => {
+                println!("Poll {:?}: None", self);
+                if let Some(idx) = query_node.parent_idx {
+                    self.query.nodes[idx].node.close(partition)
+                }
+            }
+            Poll::Pending => println!("Poll {:?}: Pending", self),
         }
     }
 }
@@ -114,9 +125,28 @@ impl ArcWake for WorkItemWaker {
     }
 }
 
+pub trait Node: Send + Sync + std::fmt::Debug {
+    /// Push a [`RecordBatch`] to the given input partition
+    fn push(&self, input: RecordBatch, partition: usize);
+
+    /// Mark a partition as exhausted
+    fn close(&self, partition: usize);
+
+    fn output_partitions(&self) -> usize;
+
+    /// Poll an output partition, attempting to get its output
+    ///
+    /// TODO: The futures plumbing is unfortunate
+    fn poll_partition(
+        &self,
+        cx: &mut Context<'_>,
+        partition: usize,
+    ) -> Poll<Option<ArrowResult<RecordBatch>>>;
+}
+
 #[derive(Debug)]
 pub struct QueryNode {
-    node: ExecutionNode,
+    node: Box<dyn Node>,
     parent_idx: Option<usize>,
 }
 
@@ -145,8 +175,29 @@ impl Query {
             let children = plan.children();
             dequeue.extend(children.into_iter().map(|plan| (plan, Some(nodes.len()))));
 
-            let node = ExecutionNode::new(plan, task_context.clone()).await?;
-            nodes.push(QueryNode { node, parent_idx });
+            let operator = if let Some(repartition) =
+                plan.as_any().downcast_ref::<RepartitionExec>()
+            {
+                Box::new(RepartitionNode::new(
+                    repartition.input().output_partitioning(),
+                    repartition.output_partitioning(),
+                )) as Box<dyn Node>
+            } else if let Some(coalesce) =
+                plan.as_any().downcast_ref::<CoalescePartitionsExec>()
+            {
+                Box::new(RepartitionNode::new(
+                    coalesce.input().output_partitioning(),
+                    Partitioning::RoundRobinBatch(1),
+                )) as Box<dyn Node>
+            } else {
+                let node = ExecutionNode::new(plan, task_context.clone()).await?;
+                Box::new(node) as Box<dyn Node>
+            };
+
+            nodes.push(QueryNode {
+                node: operator,
+                parent_idx,
+            });
         }
 
         let (sender, receiver) = mpsc::unbounded();

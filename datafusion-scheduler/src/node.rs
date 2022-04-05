@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryFutureExt};
 use parking_lot::Mutex;
 
+use crate::query::Node;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::{error::Result as ArrowResult, record_batch::RecordBatch};
 use datafusion::error::Result;
@@ -25,16 +26,13 @@ use datafusion::physical_plan::{
 ///
 /// This is hopefully a temporary hack, pending reworking the [`ExecutionPlan`] trait
 pub struct ExecutionNode {
-    inner: Arc<dyn ExecutionPlan>,
     inputs: Vec<Arc<Mutex<InputPartition>>>,
     outputs: Vec<Mutex<SendableRecordBatchStream>>,
 }
 
 impl std::fmt::Debug for ExecutionNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExecutionNode")
-            .field("inner", &self.inner)
-            .finish()
+        f.debug_struct("ExecutionNode").finish()
     }
 }
 
@@ -52,7 +50,11 @@ impl ExecutionNode {
             for child in children {
                 let count = child.output_partitioning().partition_count();
 
-                let child_inputs = vec![Default::default(); count];
+                let mut child_inputs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    child_inputs.push(Default::default())
+                }
+
                 inputs.extend_from_slice(&child_inputs);
                 proxies.push(Arc::new(ProxyExecutionPlan {
                     inner: child,
@@ -73,16 +75,15 @@ impl ExecutionNode {
         )
         .await?;
 
-        Ok(Self {
-            inner: plan,
-            inputs,
-            outputs,
-        })
+        Ok(Self { inputs, outputs })
     }
+}
 
+impl Node for ExecutionNode {
     /// Push a [`RecordBatch`] to the given input partition
-    pub fn push(&self, input: RecordBatch, partition: usize) {
+    fn push(&self, input: RecordBatch, partition: usize) {
         let mut partition = self.inputs[partition].lock();
+        assert!(!partition.is_closed);
 
         partition.buffer.push_back(input);
         for waker in partition.wait_list.drain(..) {
@@ -90,12 +91,23 @@ impl ExecutionNode {
         }
     }
 
-    pub fn output_partitions(&self) -> usize {
+    fn close(&self, partition: usize) {
+        println!("Closing partition: {}", partition);
+        let mut partition = self.inputs[partition].lock();
+        assert!(!partition.is_closed);
+
+        partition.is_closed = true;
+        for waker in partition.wait_list.drain(..) {
+            waker.wake()
+        }
+    }
+
+    fn output_partitions(&self) -> usize {
         self.outputs.len()
     }
 
     /// Poll an output partition, attempting to get its output
-    pub fn poll_partition(
+    fn poll_partition(
         &self,
         cx: &mut Context<'_>,
         partition: usize,
@@ -108,6 +120,7 @@ impl ExecutionNode {
 struct InputPartition {
     buffer: VecDeque<RecordBatch>,
     wait_list: Vec<Waker>,
+    is_closed: bool,
 }
 
 struct InputPartitionStream {
@@ -120,11 +133,14 @@ impl Stream for InputPartitionStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut partition = self.partition.lock();
-        if let Some(batch) = partition.buffer.pop_front() {
-            return Poll::Ready(Some(Ok(batch)));
+        match partition.buffer.pop_front() {
+            Some(batch) => Poll::Ready(Some(Ok(batch))),
+            None if partition.is_closed => Poll::Ready(None),
+            _ => {
+                partition.wait_list.push(cx.waker().clone());
+                Poll::Pending
+            }
         }
-        partition.wait_list.push(cx.waker().clone());
-        Poll::Pending
     }
 }
 

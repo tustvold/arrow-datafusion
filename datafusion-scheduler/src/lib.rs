@@ -27,6 +27,7 @@ use std::thread::JoinHandle;
 
 mod node;
 mod query;
+mod repartition;
 
 pub struct Scheduler {
     worker: Worker,
@@ -109,7 +110,9 @@ mod tests {
     use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float64Type, Int32Type};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
-    use datafusion::prelude::SessionContext;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use futures::TryStreamExt;
     use rand::distributions::uniform::SampleUniform;
     use rand::{thread_rng, Rng};
     use std::ops::Range;
@@ -137,8 +140,8 @@ mod tests {
         RecordBatch::try_from_iter([("a", a), ("b", b)]).unwrap()
     }
 
-    #[test]
-    fn test_simple() {
+    #[tokio::test]
+    async fn test_simple() {
         let scheduler = Scheduler::new();
         let mut rng = thread_rng();
 
@@ -159,24 +162,23 @@ mod tests {
         let schema = batches.first().unwrap().first().unwrap().schema();
         let provider = MemTable::try_new(schema, batches).unwrap();
 
-        let mut context = SessionContext::new();
+        let config = SessionConfig::new().with_target_partitions(2);
+        let mut context = SessionContext::with_config(config);
+
         context.register_table("t", Arc::new(provider)).unwrap();
 
         let task = context.task_ctx();
 
-        let stream = futures::executor::block_on(async {
-            let query = context.sql("SELECT * FROM t").await.unwrap();
-            let plan = query.create_physical_plan().await.unwrap();
-            scheduler.schedule_plan(plan, task).await.unwrap()
-        });
+        let query = context.sql("SELECT * FROM t where a > 100").await.unwrap();
 
-        let batches = futures::executor::block_on_stream(stream)
-            .collect::<ArrowResult<Vec<_>>>()
-            .unwrap();
+        let plan = query.create_physical_plan().await.unwrap();
 
-        let total = batches.iter().map(|x| x.num_rows()).sum::<usize>();
-        let expected_total = batches_per_partition * rows_per_batch * num_partitions;
+        println!("Plan: {}", displayable(plan.as_ref()).indent());
 
-        assert_eq!(total, expected_total);
+        let stream = scheduler.schedule_plan(plan, task).await.unwrap();
+        let scheduled: Vec<_> = stream.try_collect().await.unwrap();
+        let expected = query.collect().await.unwrap();
+
+        assert_eq!(scheduled, expected);
     }
 }
