@@ -1,6 +1,6 @@
 use crate::node::ExecutionNode;
 use crate::repartition::RepartitionNode;
-use crate::{ArrowResult, Spawner};
+use crate::{spawn_local, ArrowResult, Spawner};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
@@ -37,7 +37,6 @@ impl WorkItem {
                     query: query.clone(),
                     waker: Arc::new(WorkItemWaker {
                         query: Arc::downgrade(&query),
-                        spawner: spawner.clone(),
                         node: node_idx,
                         partition,
                     }),
@@ -76,7 +75,7 @@ impl WorkItem {
                 }
 
                 // Reschedule this task for the next batch
-                self.waker.spawner.spawn(Self {
+                spawn_local(Self {
                     query: self.query,
                     waker: self.waker.clone(),
                 });
@@ -101,8 +100,6 @@ impl WorkItem {
 
 struct WorkItemWaker {
     query: Weak<Query>,
-    // TODO: Use worker-sticky spawner
-    spawner: Spawner,
     node: usize,
     partition: usize,
 }
@@ -115,7 +112,7 @@ impl ArcWake for WorkItemWaker {
                 waker: self.clone(),
             };
             println!("Wakeup {:?}", item);
-            self.spawner.spawn(item)
+            spawn_local(item)
         } else {
             println!("Dropped wakeup");
         }

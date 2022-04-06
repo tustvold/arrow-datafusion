@@ -23,6 +23,7 @@ use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::stream::{BoxStream, StreamExt};
 use parking_lot::{Condvar, Mutex};
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -69,6 +70,15 @@ struct ThreadState {
     steal: Vec<crossbeam_deque::Stealer<WorkItem>>,
 }
 
+thread_local! {
+    static CURRENT_THREAD: RefCell<Option<ThreadState>> = RefCell::new(None)
+}
+
+/// Spawns a [`WorkItem`] to the worker local queue
+fn spawn_local(item: WorkItem) {
+    ThreadState::local(|s| s.local.push(item))
+}
+
 impl ThreadState {
     fn find_task(&self) -> Option<WorkItem> {
         // Pop a task from the local queue, if not empty.
@@ -89,12 +99,22 @@ impl ThreadState {
         })
     }
 
-    fn run(&self) {
+    fn local<F, T>(f: F) -> T
+    where
+        F: FnOnce(&Self) -> T,
+    {
+        CURRENT_THREAD.with(|s| f(s.borrow().as_ref().expect("worker thread")))
+    }
+
+    fn run(self) {
+        let shared = self.shared.clone();
+        CURRENT_THREAD.with(|s| *s.borrow_mut() = Some(self));
+
         loop {
-            match self.find_task() {
+            match Self::local(Self::find_task) {
                 Some(task) => task.do_work(),
                 None => {
-                    if !self.wait_for_input() {
+                    if !Self::wait_for_input(&shared) {
                         println!("Worker shutting down");
                         break;
                     }
@@ -104,12 +124,12 @@ impl ThreadState {
     }
 
     /// Park this thread, returning false if this worker should terminate
-    fn wait_for_input(&self) -> bool {
-        let mut lock = self.shared.inner.lock();
+    fn wait_for_input(shared: &SharedState) -> bool {
+        let mut lock = shared.inner.lock();
         if lock.is_shutdown {
             return false;
         }
-        self.shared.signal.wait(&mut lock);
+        shared.signal.wait(&mut lock);
         !lock.is_shutdown
     }
 }
