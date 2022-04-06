@@ -1,17 +1,23 @@
-use crate::node::ExecutionNode;
-use crate::repartition::RepartitionNode;
-use crate::{spawn_local, ArrowResult, Spawner};
+use std::collections::VecDeque;
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
+
+use futures::channel::mpsc;
+use futures::task::ArcWake;
+
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
-use futures::channel::mpsc;
-use futures::task::ArcWake;
-use std::collections::VecDeque;
-use std::sync::{Arc, Weak};
-use std::task::{Context, Poll};
+
+use crate::node::ExecutionNode;
+use crate::repartition::RepartitionNode;
+use crate::{
+    worker::{spawn_local, Spawner},
+    ArrowResult,
+};
 
 pub struct WorkItem {
     query: Arc<Query>,
