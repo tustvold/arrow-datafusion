@@ -1,3 +1,4 @@
+use arrow::error::ArrowError;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt::Formatter;
@@ -6,10 +7,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryFutureExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 
 use crate::query::Node;
+use crate::BoxStream;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::{error::Result as ArrowResult, record_batch::RecordBatch};
 use datafusion::error::Result;
@@ -26,8 +28,8 @@ use datafusion::physical_plan::{
 ///
 /// This is hopefully a temporary hack, pending reworking the [`ExecutionPlan`] trait
 pub struct ExecutionNode {
-    inputs: Vec<Arc<Mutex<InputPartition>>>,
-    outputs: Vec<Mutex<SendableRecordBatchStream>>,
+    inputs: Vec<Vec<Arc<Mutex<InputPartition>>>>,
+    outputs: Vec<Mutex<BoxStream<'static, ArrowResult<RecordBatch>>>>,
 }
 
 impl std::fmt::Debug for ExecutionNode {
@@ -37,16 +39,17 @@ impl std::fmt::Debug for ExecutionNode {
 }
 
 impl ExecutionNode {
-    pub async fn new(
+    pub fn new(
         plan: Arc<dyn ExecutionPlan>,
         task_context: Arc<TaskContext>,
     ) -> Result<Self> {
         let children = plan.children();
-        let mut inputs = Vec::new();
+        let mut inputs = Vec::with_capacity(children.len());
 
         let proxied = if !children.is_empty() {
             let mut proxies: Vec<Arc<dyn ExecutionPlan>> =
                 Vec::with_capacity(children.len());
+
             for child in children {
                 let count = child.output_partitioning().partition_count();
 
@@ -55,7 +58,7 @@ impl ExecutionNode {
                     child_inputs.push(Default::default())
                 }
 
-                inputs.extend_from_slice(&child_inputs);
+                inputs.push(child_inputs.clone());
                 proxies.push(Arc::new(ProxyExecutionPlan {
                     inner: child,
                     inputs: child_inputs,
@@ -67,13 +70,23 @@ impl ExecutionNode {
             plan.clone()
         };
 
+        // This somewhat perverse construction is necessary to handle operators that perform
+        // computation with `ExecutionPlan::execute`
         let output_count = proxied.output_partitioning().partition_count();
+        let outputs = (0..output_count)
+            .map(|x| {
+                let proxy_captured = proxied.clone();
+                let task_captured = task_context.clone();
+                let fut = async move {
+                    proxy_captured
+                        .execute(x, task_captured)
+                        .await
+                        .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+                };
 
-        let outputs = futures::future::try_join_all(
-            (0..output_count)
-                .map(|x| proxied.execute(x, task_context.clone()).map_ok(Mutex::new)),
-        )
-        .await?;
+                Mutex::new(futures::stream::once(fut).try_flatten().boxed())
+            })
+            .collect();
 
         Ok(Self { inputs, outputs })
     }
@@ -81,8 +94,8 @@ impl ExecutionNode {
 
 impl Node for ExecutionNode {
     /// Push a [`RecordBatch`] to the given input partition
-    fn push(&self, input: RecordBatch, partition: usize) {
-        let mut partition = self.inputs[partition].lock();
+    fn push(&self, input: RecordBatch, child: usize, partition: usize) {
+        let mut partition = self.inputs[child][partition].lock();
         assert!(!partition.is_closed);
 
         partition.buffer.push_back(input);
@@ -91,9 +104,9 @@ impl Node for ExecutionNode {
         }
     }
 
-    fn close(&self, partition: usize) {
+    fn close(&self, child: usize, partition: usize) {
         println!("Closing partition: {}", partition);
-        let mut partition = self.inputs[partition].lock();
+        let mut partition = self.inputs[child][partition].lock();
         assert!(!partition.is_closed);
 
         partition.is_closed = true;

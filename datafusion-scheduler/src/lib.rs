@@ -44,12 +44,12 @@ impl Scheduler {
         }
     }
 
-    pub async fn schedule_plan(
+    pub fn schedule_plan(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         context: Arc<TaskContext>,
     ) -> Result<BoxStream<'static, ArrowResult<RecordBatch>>> {
-        let (query, receiver) = Query::new(plan, context).await?;
+        let (query, receiver) = Query::new(plan, context)?;
         WorkItem::spawn_query(self.pool.spawner(), Arc::new(query));
         Ok(receiver.boxed())
     }
@@ -66,13 +66,13 @@ mod tests {
     use std::ops::Range;
 
     use futures::TryStreamExt;
-    use rand::{Rng, thread_rng};
     use rand::distributions::uniform::SampleUniform;
+    use rand::{thread_rng, Rng};
 
     use datafusion::arrow::array::{ArrayRef, PrimitiveArray};
     use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float64Type, Int32Type};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::datasource::MemTable;
+    use datafusion::datasource::{MemTable, TableProvider};
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
@@ -101,30 +101,14 @@ mod tests {
         RecordBatch::try_from_iter([("a", a), ("b", b)]).unwrap()
     }
 
-    // This is a temporary hack until #1939 is fixed
-    fn format_batches(batches: &[RecordBatch]) -> Vec<String> {
-        let formatted = arrow::util::pretty::pretty_format_batches(batches)
-            .unwrap()
-            .to_string();
-        let mut split: Vec<_> = formatted.split('\n').map(ToString::to_string).collect();
-
-        let num_lines = split.len();
-        if num_lines > 3 {
-            split.as_mut_slice()[2..num_lines - 1].sort_unstable()
-        }
-        split
-    }
-
-    #[tokio::test]
-    async fn test_simple() {
-        let scheduler = Scheduler::new();
+    fn make_batches() -> Vec<Vec<RecordBatch>> {
         let mut rng = thread_rng();
 
         let batches_per_partition = 3;
         let rows_per_batch = 1000;
         let num_partitions = 2;
 
-        let batches: Vec<Vec<_>> = std::iter::from_fn(|| {
+        std::iter::from_fn(|| {
             Some(
                 std::iter::from_fn(|| Some(generate_batch(&mut rng, rows_per_batch)))
                     .take(batches_per_partition)
@@ -132,35 +116,40 @@ mod tests {
             )
         })
         .take(num_partitions)
-        .collect();
+        .collect()
+    }
 
+    fn make_provider() -> Arc<dyn TableProvider> {
+        let batches = make_batches();
         let schema = batches.first().unwrap().first().unwrap().schema();
-        let provider = MemTable::try_new(schema, batches).unwrap();
+        Arc::new(MemTable::try_new(schema, make_batches()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_simple() {
+        let scheduler = Scheduler::new();
 
         let config = SessionConfig::new().with_target_partitions(2);
         let mut context = SessionContext::with_config(config);
 
-        context.register_table("t", Arc::new(provider)).unwrap();
+        context.register_table("table1", make_provider()).unwrap();
+        context.register_table("table2", make_provider()).unwrap();
 
         let task = context.task_ctx();
 
-        let query = context.sql("SELECT * FROM t where a > 100").await.unwrap();
+        let query = context
+            .sql("SELECT * FROM table1 where a > 100 order by a, b")
+            .await
+            .unwrap();
 
         let plan = query.create_physical_plan().await.unwrap();
 
         println!("Plan: {}", displayable(plan.as_ref()).indent());
 
-        let stream = scheduler.schedule_plan(plan, task).await.unwrap();
+        let stream = scheduler.schedule_plan(plan, task).unwrap();
         let scheduled: Vec<_> = stream.try_collect().await.unwrap();
         let expected = query.collect().await.unwrap();
 
-        let scheduled_formatted = format_batches(&scheduled);
-        let expected_formatted = format_batches(&expected);
-
-        assert_eq!(
-            scheduled_formatted, expected_formatted,
-            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-            expected_formatted, scheduled_formatted
-        );
+        assert_eq!(scheduled, expected);
     }
 }

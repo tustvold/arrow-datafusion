@@ -66,13 +66,15 @@ impl WorkItem {
         match query_node.node.poll_partition(&mut cx, partition) {
             Poll::Ready(Some(Ok(batch))) => {
                 println!("Poll {:?}: Ok: {}", self, batch.num_rows());
-                match query_node.parent_idx {
-                    Some(idx) => {
+                match query_node.parent {
+                    Some(link) => {
                         println!(
-                            "Published batch to node {} partition {}",
-                            idx, partition
+                            "Published batch to node {:?} partition {}",
+                            link, partition
                         );
-                        self.query.nodes[idx].node.push(batch, partition)
+                        self.query.nodes[link.node]
+                            .node
+                            .push(batch, link.child, partition)
                     }
                     None => {
                         println!("Published batch to output");
@@ -89,14 +91,18 @@ impl WorkItem {
             Poll::Ready(Some(Err(e))) => {
                 println!("Poll {:?}: Error: {:?}", self, e);
                 let _ = self.query.output.unbounded_send(Err(e));
-                if let Some(idx) = query_node.parent_idx {
-                    self.query.nodes[idx].node.close(partition)
+                if let Some(link) = query_node.parent {
+                    self.query.nodes[link.node]
+                        .node
+                        .close(link.child, partition)
                 }
             }
             Poll::Ready(None) => {
                 println!("Poll {:?}: None", self);
-                if let Some(idx) = query_node.parent_idx {
-                    self.query.nodes[idx].node.close(partition)
+                if let Some(link) = query_node.parent {
+                    self.query.nodes[link.node]
+                        .node
+                        .close(link.child, partition)
                 }
             }
             Poll::Pending => println!("Poll {:?}: Pending", self),
@@ -131,10 +137,10 @@ impl ArcWake for WorkItemWaker {
 
 pub trait Node: Send + Sync + std::fmt::Debug {
     /// Push a [`RecordBatch`] to the given input partition
-    fn push(&self, input: RecordBatch, partition: usize);
+    fn push(&self, input: RecordBatch, child: usize, partition: usize);
 
     /// Mark a partition as exhausted
-    fn close(&self, partition: usize);
+    fn close(&self, child: usize, partition: usize);
 
     fn output_partitions(&self) -> usize;
 
@@ -148,10 +154,16 @@ pub trait Node: Send + Sync + std::fmt::Debug {
     ) -> Poll<Option<ArrowResult<RecordBatch>>>;
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParentLink {
+    node: usize,
+    child: usize,
+}
+
 #[derive(Debug)]
 pub struct QueryNode {
     node: Box<dyn Node>,
-    parent_idx: Option<usize>,
+    parent: Option<ParentLink>,
 }
 
 #[derive(Debug)]
@@ -167,7 +179,7 @@ impl Drop for Query {
 }
 
 impl Query {
-    pub async fn new(
+    pub fn new(
         plan: Arc<dyn ExecutionPlan>,
         task_context: Arc<TaskContext>,
     ) -> Result<(Query, mpsc::UnboundedReceiver<ArrowResult<RecordBatch>>)> {
@@ -177,9 +189,15 @@ impl Query {
 
         // TODO: Group non-pipeline breaking operations into a single ExecutionNode
 
-        while let Some((plan, parent_idx)) = dequeue.pop_front() {
+        while let Some((plan, parent)) = dequeue.pop_front() {
             let children = plan.children();
-            dequeue.extend(children.into_iter().map(|plan| (plan, Some(nodes.len()))));
+            dequeue.extend(children.into_iter().enumerate().map(|(child, plan)| {
+                let parent = ParentLink {
+                    node: nodes.len(),
+                    child,
+                };
+                (plan, Some(parent))
+            }));
 
             let operator = if let Some(repartition) =
                 plan.as_any().downcast_ref::<RepartitionExec>()
@@ -196,13 +214,13 @@ impl Query {
                     Partitioning::RoundRobinBatch(1),
                 )) as Box<dyn Node>
             } else {
-                let node = ExecutionNode::new(plan, task_context.clone()).await?;
+                let node = ExecutionNode::new(plan, task_context.clone())?;
                 Box::new(node) as Box<dyn Node>
             };
 
             nodes.push(QueryNode {
                 node: operator,
-                parent_idx,
+                parent,
             });
         }
 

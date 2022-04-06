@@ -46,9 +46,10 @@ struct RepartitionState {
 }
 
 impl Node for RepartitionNode {
-    fn push(&self, input: RecordBatch, partition: usize) {
-        // Currently only support round robin batch
+    fn push(&self, input: RecordBatch, child: usize, partition: usize) {
+        assert_eq!(child, 0);
 
+        // Currently only support round robin batch
         let mut state = self.state.lock();
         assert!(!state.partition_closed[partition]);
 
@@ -64,7 +65,9 @@ impl Node for RepartitionNode {
         }
     }
 
-    fn close(&self, partition: usize) {
+    fn close(&self, child: usize, partition: usize) {
+        assert_eq!(child, 0);
+
         let mut state = self.state.lock();
         assert!(!state.partition_closed[partition]);
         state.partition_closed[partition] = true;
