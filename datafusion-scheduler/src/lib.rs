@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::query::{Query, WorkItem};
+use crossbeam_deque::Steal;
 use datafusion::arrow::error::Result as ArrowResult;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
@@ -65,9 +66,10 @@ struct WorkerThread {
 }
 
 struct ThreadState {
+    idx: usize,
     shared: Arc<SharedState>,
     local: crossbeam_deque::Worker<WorkItem>,
-    steal: Vec<crossbeam_deque::Stealer<WorkItem>>,
+    steal: Vec<(usize, crossbeam_deque::Stealer<WorkItem>)>,
 }
 
 thread_local! {
@@ -76,27 +78,47 @@ thread_local! {
 
 /// Spawns a [`WorkItem`] to the worker local queue
 fn spawn_local(item: WorkItem) {
-    ThreadState::local(|s| s.local.push(item))
+    ThreadState::local(|s| {
+        println!("Spawning {:?} to local worker {}", item, s.idx);
+        s.local.push(item)
+    })
 }
 
 impl ThreadState {
     fn find_task(&self) -> Option<WorkItem> {
-        // Pop a task from the local queue, if not empty.
-        self.local.pop().or_else(|| {
-            // Otherwise, we need to look for a task elsewhere.
-            std::iter::repeat_with(|| {
-                // Try stealing a batch of tasks from the global queue.
-                self.shared
-                    .injector
-                    .steal_batch_and_pop(&self.local)
-                    // Or try stealing a task from one of the other threads.
-                    .or_else(|| self.steal.iter().map(|s| s.steal()).collect())
-            })
-            // Loop while no task was stolen and any steal operation needs to be retried.
-            .find(|s| !s.is_retry())
-            // Extract the stolen task, if there is one.
-            .and_then(|s| s.success())
-        })
+        if let Some(item) = self.local.pop() {
+            println!("Worker {} fetched {:?} from local queue", self.idx, item);
+            return Some(item);
+        }
+
+        loop {
+            match self.shared.injector.steal_batch_and_pop(&self.local) {
+                Steal::Success(item) => {
+                    println!("Worker {} fetched {:?} from injector", self.idx, item);
+                    return Some(item);
+                }
+                Steal::Retry => continue,
+                Steal::Empty => {}
+            }
+
+            // TODO: Should the search order be randomized?
+            for (idx, steal) in &self.steal {
+                match steal.steal() {
+                    Steal::Success(item) => {
+                        println!(
+                            "Worker {} stole {:?} from worker {}",
+                            self.idx, item, idx
+                        );
+                        return Some(item);
+                    }
+                    Steal::Retry => continue,
+                    Steal::Empty => {}
+                }
+            }
+
+            println!("Worker {} failed to find any work", self.idx);
+            return None;
+        }
     }
 
     fn local<F, T>(f: F) -> T
@@ -108,14 +130,16 @@ impl ThreadState {
 
     fn run(self) {
         let shared = self.shared.clone();
+        let worker_idx = self.idx;
+
         CURRENT_THREAD.with(|s| *s.borrow_mut() = Some(self));
 
         loop {
             match Self::local(Self::find_task) {
                 Some(task) => task.do_work(),
                 None => {
-                    if !Self::wait_for_input(&shared) {
-                        println!("Worker shutting down");
+                    if !Self::wait_for_input(worker_idx, &shared) {
+                        println!("Worker {} shutting down", worker_idx);
                         break;
                     }
                 }
@@ -124,12 +148,16 @@ impl ThreadState {
     }
 
     /// Park this thread, returning false if this worker should terminate
-    fn wait_for_input(shared: &SharedState) -> bool {
+    fn wait_for_input(worker_idx: usize, shared: &SharedState) -> bool {
         let mut lock = shared.inner.lock();
         if lock.is_shutdown {
             return false;
         }
+
+        println!("Worker {} entered sleep", worker_idx);
         shared.signal.wait(&mut lock);
+        println!("Worker {} exited sleep", worker_idx);
+
         !lock.is_shutdown
     }
 }
@@ -160,7 +188,6 @@ impl WorkerPool {
             inner: Arc::new(Mutex::new(SharedStateInner { is_shutdown: false })),
         });
 
-        // TODO: Would LIFO be better?
         let worker_queues: Vec<_> = (0..workers)
             .map(|_| crossbeam_deque::Worker::new_fifo())
             .collect();
@@ -174,13 +201,14 @@ impl WorkerPool {
                     .iter()
                     .enumerate()
                     .filter(|(steal_idx, _)| *steal_idx != idx)
-                    .map(|(_, stealer)| stealer.clone())
+                    .map(|(steal_idx, steal)| (steal_idx, steal.clone()))
                     .collect();
 
                 let state = ThreadState {
-                    shared: shared.clone(),
+                    idx,
                     local,
                     steal,
+                    shared: shared.clone(),
                 };
 
                 WorkerThread {
@@ -203,8 +231,10 @@ impl WorkerPool {
         self.shared.inner.lock().is_shutdown = true;
         self.shared.signal.notify_all();
 
-        for worker in self.workers.drain(..) {
-            worker.handle.join().expect("worker panicked");
+        for (idx, worker) in self.workers.drain(..).enumerate() {
+            if let Err(_) = worker.handle.join() {
+                panic!("worker {} panicked", idx)
+            }
         }
     }
 }
@@ -216,7 +246,7 @@ pub struct Spawner {
 
 impl Spawner {
     fn spawn(&self, task: WorkItem) {
-        println!("Spawning {:?}", task);
+        println!("Spawning {:?} to any worker", task);
         self.shared.injector.push(task);
 
         // Ensure that at least one worker thread is awake
@@ -261,6 +291,20 @@ mod tests {
         RecordBatch::try_from_iter([("a", a), ("b", b)]).unwrap()
     }
 
+    // This is a temporary hack until #1939 is fixed
+    fn format_batches(batches: &[RecordBatch]) -> Vec<String> {
+        let formatted = arrow::util::pretty::pretty_format_batches(batches)
+            .unwrap()
+            .to_string();
+        let mut split: Vec<_> = formatted.split('\n').map(ToString::to_string).collect();
+
+        let num_lines = split.len();
+        if num_lines > 3 {
+            split.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+        split
+    }
+
     #[tokio::test]
     async fn test_simple() {
         let scheduler = Scheduler::new();
@@ -300,6 +344,13 @@ mod tests {
         let scheduled: Vec<_> = stream.try_collect().await.unwrap();
         let expected = query.collect().await.unwrap();
 
-        assert_eq!(scheduled, expected);
+        let scheduled_formatted = format_batches(&scheduled);
+        let expected_formatted = format_batches(&expected);
+
+        assert_eq!(
+            scheduled_formatted, expected_formatted,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_formatted, scheduled_formatted
+        );
     }
 }

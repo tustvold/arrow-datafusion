@@ -35,6 +35,7 @@ path = "src/lib.rs"
 [features]
 
 [dependencies]
+arrow = { version = "11" }
 datafusion = { path = "../datafusion", version = "7.0.0" }
 futures = "0.3"
 parking_lot = "0.12"
