@@ -22,6 +22,7 @@ use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::stream::{BoxStream, StreamExt};
+use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -30,13 +31,13 @@ mod query;
 mod repartition;
 
 pub struct Scheduler {
-    worker: Worker,
+    pool: WorkerPool,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
         Self {
-            worker: Worker::new(),
+            pool: WorkerPool::new(2),
         }
     }
 
@@ -46,60 +47,160 @@ impl Scheduler {
         context: Arc<TaskContext>,
     ) -> Result<BoxStream<'static, ArrowResult<RecordBatch>>> {
         let (query, receiver) = Query::new(plan, context).await?;
-        WorkItem::spawn_query(&self.worker.spawner, Arc::new(query));
+        WorkItem::spawn_query(self.pool.spawner(), Arc::new(query));
         Ok(receiver.boxed())
     }
 }
 
-struct Worker {
-    spawner: Spawner,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl Worker {
-    fn new() -> Self {
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        let spawner = Spawner { sender };
-
-        let handle = std::thread::spawn(move || {
-            for item in receiver {
-                match item {
-                    Some(item) => item.do_work(),
-                    None => break,
-                }
-            }
-        });
-
-        Self {
-            handle: Some(handle),
-            spawner,
-        }
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        self.pool.shutdown()
     }
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.spawner.shutdown();
+#[derive(Debug)]
+struct WorkerThread {
+    handle: JoinHandle<()>,
+}
 
-        let handle = self.handle.take().expect("already dropped");
-        handle.join().expect("worker panicked");
+struct ThreadState {
+    shared: Arc<SharedState>,
+    local: crossbeam_deque::Worker<WorkItem>,
+    steal: Vec<crossbeam_deque::Stealer<WorkItem>>,
+}
+
+impl ThreadState {
+    fn find_task(&self) -> Option<WorkItem> {
+        // Pop a task from the local queue, if not empty.
+        self.local.pop().or_else(|| {
+            // Otherwise, we need to look for a task elsewhere.
+            std::iter::repeat_with(|| {
+                // Try stealing a batch of tasks from the global queue.
+                self.shared
+                    .injector
+                    .steal_batch_and_pop(&self.local)
+                    // Or try stealing a task from one of the other threads.
+                    .or_else(|| self.steal.iter().map(|s| s.steal()).collect())
+            })
+            // Loop while no task was stolen and any steal operation needs to be retried.
+            .find(|s| !s.is_retry())
+            // Extract the stolen task, if there is one.
+            .and_then(|s| s.success())
+        })
+    }
+
+    fn run(&self) {
+        loop {
+            match self.find_task() {
+                Some(task) => task.do_work(),
+                None => {
+                    if !self.wait_for_input() {
+                        println!("Worker shutting down");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Park this thread, returning false if this worker should terminate
+    fn wait_for_input(&self) -> bool {
+        let mut lock = self.shared.inner.lock();
+        if lock.is_shutdown {
+            return false;
+        }
+        self.shared.signal.wait(&mut lock);
+        !lock.is_shutdown
+    }
+}
+
+#[derive(Debug)]
+struct SharedState {
+    injector: crossbeam_deque::Injector<WorkItem>,
+    signal: Condvar,
+    inner: Arc<Mutex<SharedStateInner>>,
+}
+
+#[derive(Debug)]
+struct SharedStateInner {
+    is_shutdown: bool,
+}
+
+#[derive(Debug)]
+struct WorkerPool {
+    shared: Arc<SharedState>,
+    workers: Vec<WorkerThread>,
+}
+
+impl WorkerPool {
+    fn new(workers: usize) -> Self {
+        let shared = Arc::new(SharedState {
+            injector: crossbeam_deque::Injector::new(),
+            signal: Default::default(),
+            inner: Arc::new(Mutex::new(SharedStateInner { is_shutdown: false })),
+        });
+
+        // TODO: Would LIFO be better?
+        let worker_queues: Vec<_> = (0..workers)
+            .map(|_| crossbeam_deque::Worker::new_fifo())
+            .collect();
+        let stealers: Vec<_> = worker_queues.iter().map(|x| x.stealer()).collect();
+
+        let workers = worker_queues
+            .into_iter()
+            .enumerate()
+            .map(|(idx, local)| {
+                let steal = stealers
+                    .iter()
+                    .enumerate()
+                    .filter(|(steal_idx, _)| *steal_idx != idx)
+                    .map(|(_, stealer)| stealer.clone())
+                    .collect();
+
+                let state = ThreadState {
+                    shared: shared.clone(),
+                    local,
+                    steal,
+                };
+
+                WorkerThread {
+                    handle: std::thread::spawn(move || state.run()),
+                }
+            })
+            .collect();
+
+        WorkerPool { shared, workers }
+    }
+
+    fn spawner(&self) -> Spawner {
+        Spawner {
+            shared: self.shared.clone(),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        println!("Shutting down worker pool");
+        self.shared.inner.lock().is_shutdown = true;
+        self.shared.signal.notify_all();
+
+        for worker in self.workers.drain(..) {
+            worker.handle.join().expect("worker panicked");
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Spawner {
-    sender: crossbeam_channel::Sender<Option<WorkItem>>,
+    shared: Arc<SharedState>,
 }
 
 impl Spawner {
-    fn shutdown(&self) {
-        println!("Worker Shutdown");
-        self.sender.send(None).expect("worker gone")
-    }
+    fn spawn(&self, task: WorkItem) {
+        println!("Spawning {:?}", task);
+        self.shared.injector.push(task);
 
-    fn spawn(&self, item: WorkItem) {
-        println!("Spawning {:?}", item);
-        self.sender.send(Some(item)).expect("worker gone")
+        // Ensure that at least one worker thread is awake
+        self.shared.signal.notify_one();
     }
 }
 

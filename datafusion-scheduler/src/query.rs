@@ -28,7 +28,7 @@ impl std::fmt::Debug for WorkItem {
 }
 
 impl WorkItem {
-    pub fn spawn_query(spawner: &Spawner, query: Arc<Query>) {
+    pub fn spawn_query(spawner: Spawner, query: Arc<Query>) {
         println!("Spawning query: {:?}", query);
 
         for (node_idx, node) in query.nodes.iter().enumerate() {
@@ -101,6 +101,7 @@ impl WorkItem {
 
 struct WorkItemWaker {
     query: Weak<Query>,
+    // TODO: Use worker-sticky spawner
     spawner: Spawner,
     node: usize,
     partition: usize,
@@ -170,6 +171,8 @@ impl Query {
         let mut nodes = Vec::new();
         let mut dequeue = VecDeque::new();
         dequeue.push_back((plan, None));
+
+        // TODO: Group non-pipeline breaking operations into a single ExecutionNode
 
         while let Some((plan, parent_idx)) = dequeue.pop_front() {
             let children = plan.children();
