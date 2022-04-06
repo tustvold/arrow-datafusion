@@ -36,6 +36,7 @@ path = "src/lib.rs"
 
 [dependencies]
 arrow = { version = "11" }
+ahash = { version = "0.7", default-features = false }
 datafusion = { path = "../datafusion", version = "7.0.0" }
 futures = "0.3"
 parking_lot = "0.12"

@@ -98,7 +98,8 @@ mod tests {
     fn generate_batch<R: Rng>(rng: &mut R, row_count: usize) -> RecordBatch {
         let a = generate_primitive::<Int32Type, _>(rng, row_count, 0.5, 0..1000);
         let b = generate_primitive::<Float64Type, _>(rng, row_count, 0.5, 0. ..1000.);
-        RecordBatch::try_from_iter([("a", a), ("b", b)]).unwrap()
+        let c = PrimitiveArray::<Int32Type>::from_iter_values(0..row_count as i32);
+        RecordBatch::try_from_iter([("a", a), ("b", b), ("c", Arc::new(c))]).unwrap()
     }
 
     fn make_batches() -> Vec<Vec<RecordBatch>> {
@@ -135,21 +136,32 @@ mod tests {
         context.register_table("table1", make_provider()).unwrap();
         context.register_table("table2", make_provider()).unwrap();
 
-        let task = context.task_ctx();
+        let queries = [
+            "select * from table1 order by a, b, c",
+            "select * from table1 where table1.a > 100 order by a, b, c",
+            "select distinct a from table1 where table1.b > 100 order by a",
+        ];
 
-        let query = context
-            .sql("SELECT * FROM table1 where a > 100 order by a, b")
-            .await
-            .unwrap();
+        for sql in queries {
+            let task = context.task_ctx();
 
-        let plan = query.create_physical_plan().await.unwrap();
+            let query = context.sql(sql).await.unwrap();
 
-        println!("Plan: {}", displayable(plan.as_ref()).indent());
+            let plan = query.create_physical_plan().await.unwrap();
 
-        let stream = scheduler.schedule_plan(plan, task).unwrap();
-        let scheduled: Vec<_> = stream.try_collect().await.unwrap();
-        let expected = query.collect().await.unwrap();
+            println!("Plan: {}", displayable(plan.as_ref()).indent());
 
-        assert_eq!(scheduled, expected);
+            let stream = scheduler.schedule_plan(plan, task).unwrap();
+            let scheduled: Vec<_> = stream.try_collect().await.unwrap();
+            let expected = query.collect().await.unwrap();
+
+            let total_expected = expected.iter().map(|x| x.num_rows()).sum::<usize>();
+            let total_scheduled = scheduled.iter().map(|x| x.num_rows()).sum::<usize>();
+            assert_eq!(total_expected, total_scheduled);
+
+            println!("Query \"{}\" produced {} rows", sql, total_expected);
+
+            assert_eq!(scheduled, expected);
+        }
     }
 }
