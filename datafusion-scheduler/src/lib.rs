@@ -38,9 +38,9 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new() -> Self {
+    pub fn new(num_threads: usize) -> Self {
         Self {
-            pool: WorkerPool::new(2),
+            pool: WorkerPool::new(num_threads),
         }
     }
 
@@ -144,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple() {
-        let scheduler = Scheduler::new();
+        let scheduler = Scheduler::new(2);
 
         let config = SessionConfig::new().with_target_partitions(2);
         let mut context = SessionContext::with_config(config);

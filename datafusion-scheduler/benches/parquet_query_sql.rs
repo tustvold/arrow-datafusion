@@ -37,7 +37,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
-use tokio_stream::StreamExt;
+use futures::stream::StreamExt;
+use datafusion_scheduler::Scheduler;
 
 /// The number of batches to write
 const NUM_BATCHES: usize = 2048;
@@ -195,6 +196,8 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     let mut context = SessionContext::new();
 
+    let scheduler = Scheduler::new(2);
+
     let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
     rt.block_on(context.register_parquet("t", file_path.as_str()))
         .unwrap();
@@ -217,12 +220,24 @@ fn criterion_benchmark(c: &mut Criterion) {
         }
 
         let query = query.as_str();
-        c.bench_function(query, |b| {
+        c.bench_function(&format!("tokio: {}", query), |b| {
             b.iter(|| {
                 let mut context = context.clone();
                 rt.block_on(async move {
                     let query = context.sql(query).await.unwrap();
                     let mut stream = query.execute_stream().await.unwrap();
+                    while stream.next().await.transpose().unwrap().is_some() {}
+                })
+            });
+        });
+
+        c.bench_function(&format!("scheduled: {}", query), |b| {
+            b.iter(|| {
+                let mut context = context.clone();
+                rt.block_on(async {
+                    let query = context.sql(query).await.unwrap();
+                    let plan = query.create_physical_plan().await.unwrap();
+                    let mut stream = scheduler.schedule_plan(plan, context.task_ctx()).unwrap();
                     while stream.next().await.transpose().unwrap().is_some() {}
                 })
             });
