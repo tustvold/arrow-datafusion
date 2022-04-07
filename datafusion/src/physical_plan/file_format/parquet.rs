@@ -17,7 +17,7 @@
 
 //! Execution plan for reading Parquet files
 
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -35,7 +35,6 @@ use crate::{
     physical_plan::{
         file_format::FileScanConfig,
         metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
-        stream::RecordBatchReceiverStream,
         DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
         Statistics,
     },
@@ -50,7 +49,7 @@ use arrow::{
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
-use log::{debug, warn};
+use log::debug;
 use parquet::arrow::ArrowWriter;
 use parquet::file::{
     metadata::RowGroupMetaData, reader::SerializedFileReader,
@@ -60,15 +59,14 @@ use parquet::file::{
 use fmt::Debug;
 use parquet::arrow::{ArrowReader, ParquetFileArrowReader};
 use parquet::file::properties::WriterProperties;
-
-use tokio::task::JoinHandle;
-use tokio::{
-    sync::mpsc::{channel, Receiver, Sender},
-    task,
-};
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use crate::physical_plan::file_format::SchemaAdapter;
+use crate::physical_plan::RecordBatchStream;
 use async_trait::async_trait;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 
 use super::PartitionColumnProjector;
 
@@ -210,62 +208,32 @@ impl ExecutionPlan for ParquetExec {
         partition_index: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // because the parquet implementation is not thread-safe, it is necessary to execute
-        // on a thread and communicate with channels
-        let (response_tx, response_rx): (
-            Sender<ArrowResult<RecordBatch>>,
-            Receiver<ArrowResult<RecordBatch>>,
-        ) = channel(2);
-
-        let partition = self.base_config.file_groups[partition_index].clone();
-        let metrics = self.metrics.clone();
         let projection = match self.base_config.file_column_projection_indices() {
             Some(proj) => proj,
             None => (0..self.base_config.file_schema.fields().len()).collect(),
         };
-        let pruning_predicate = self.pruning_predicate.clone();
-        let batch_size = context.session_config().batch_size;
-        let limit = self.base_config.limit;
-        let object_store = Arc::clone(&self.base_config.object_store);
         let partition_col_proj = PartitionColumnProjector::new(
             Arc::clone(&self.projected_schema),
             &self.base_config.table_partition_cols,
         );
 
-        let adapter = SchemaAdapter::new(self.base_config.file_schema.clone());
+        let stream = ParquetExecStream {
+            error: false,
+            partition_index,
+            metrics: self.metrics.clone(),
+            object_store: self.base_config.object_store.clone(),
+            pruning_predicate: self.pruning_predicate.clone(),
+            batch_size: context.session_config().batch_size,
+            schema: self.projected_schema.clone(),
+            projection,
+            remaining_rows: self.base_config.limit,
+            reader: None,
+            files: self.base_config.file_groups[partition_index].clone().into(),
+            projector: partition_col_proj,
+            adapter: SchemaAdapter::new(self.base_config.file_schema.clone()),
+        };
 
-        let join_handle = task::spawn_blocking(move || {
-            if let Err(e) = read_partition(
-                object_store.as_ref(),
-                adapter,
-                partition_index,
-                &partition,
-                metrics,
-                &projection,
-                &pruning_predicate,
-                batch_size,
-                response_tx.clone(),
-                limit,
-                partition_col_proj,
-            ) {
-                warn!(
-                    "Parquet reader thread terminated due to error: {:?} for files: {:?}",
-                    e, partition
-                );
-                // Send the error back to the main thread.
-                //
-                // Ignore error sending (via `.ok()`) because that
-                // means the receiver has been torn down (and nothing
-                // cares about the errors anymore)
-                send_result(&response_tx, Err(e.into())).ok();
-            }
-        });
-
-        Ok(RecordBatchReceiverStream::create(
-            &self.projected_schema,
-            response_rx,
-            join_handle,
-        ))
+        Ok(Box::pin(stream))
     }
 
     fn fmt_as(
@@ -294,15 +262,123 @@ impl ExecutionPlan for ParquetExec {
     }
 }
 
-fn send_result(
-    response_tx: &Sender<ArrowResult<RecordBatch>>,
-    result: ArrowResult<RecordBatch>,
-) -> Result<()> {
-    // Note this function is running on its own blockng tokio thread so blocking here is ok.
-    response_tx
-        .blocking_send(result)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    Ok(())
+struct ParquetExecStream {
+    error: bool,
+    partition_index: usize,
+    metrics: ExecutionPlanMetricsSet,
+    object_store: Arc<dyn ObjectStore>,
+    pruning_predicate: Option<PruningPredicate>,
+    batch_size: usize,
+    schema: SchemaRef,
+    projection: Vec<usize>,
+    remaining_rows: Option<usize>,
+    reader: Option<(ParquetRecordBatchReader, PartitionedFile)>,
+    files: VecDeque<PartitionedFile>,
+    projector: PartitionColumnProjector,
+    adapter: SchemaAdapter,
+}
+
+impl ParquetExecStream {
+    fn create_reader(
+        &mut self,
+        file: &PartitionedFile,
+    ) -> Result<ParquetRecordBatchReader> {
+        let file_metrics = ParquetFileMetrics::new(
+            self.partition_index,
+            file.file_meta.path(),
+            &self.metrics,
+        );
+        let object_reader = self
+            .object_store
+            .file_reader(file.file_meta.sized_file.clone())?;
+
+        let mut opt = ReadOptionsBuilder::new();
+        if let Some(pruning_predicate) = &self.pruning_predicate {
+            opt = opt.with_predicate(build_row_group_predicate(
+                pruning_predicate,
+                file_metrics,
+            ));
+        }
+
+        let file_reader = SerializedFileReader::new_with_options(
+            ChunkObjectReader(object_reader),
+            opt.build(),
+        )?;
+
+        let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
+
+        let adapted_projections = self
+            .adapter
+            .map_projections(&arrow_reader.get_schema()?, &self.projection)?;
+
+        let reader = arrow_reader
+            .get_record_reader_by_columns(adapted_projections, self.batch_size)?;
+
+        Ok(reader)
+    }
+}
+
+impl Stream for ParquetExecStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.error || matches!(this.remaining_rows, Some(0)) {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            let (reader, file) = match this.reader.as_mut() {
+                Some(current) => current,
+                None => match this.files.pop_front() {
+                    None => return Poll::Ready(None),
+                    Some(file) => match this.create_reader(&file) {
+                        Ok(reader) => this.reader.insert((reader, file)),
+                        Err(e) => {
+                            this.error = true;
+                            return Poll::Ready(Some(Err(ArrowError::ExternalError(
+                                Box::new(e),
+                            ))));
+                        }
+                    },
+                },
+            };
+
+            let result = match reader.next() {
+                Some(result) => result,
+                None => {
+                    this.reader = None;
+                    continue;
+                }
+            };
+
+            let result = result
+                .and_then(|batch| {
+                    this.adapter
+                        .adapt_batch(batch, &this.projection)
+                        .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+                })
+                .and_then(|batch| this.projector.project(batch, &file.partition_values));
+
+            match (&result, this.remaining_rows.as_mut()) {
+                (Ok(batch), Some(remaining_rows)) => {
+                    *remaining_rows = remaining_rows.saturating_sub(batch.num_rows());
+                }
+                _ => this.error = result.is_err(),
+            }
+
+            return Poll::Ready(Some(result));
+        }
+    }
+}
+
+impl RecordBatchStream for ParquetExecStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }
 
 /// Wraps parquet statistics in a way
@@ -436,89 +512,6 @@ fn build_row_group_predicate(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_partition(
-    object_store: &dyn ObjectStore,
-    schema_adapter: SchemaAdapter,
-    partition_index: usize,
-    partition: &[PartitionedFile],
-    metrics: ExecutionPlanMetricsSet,
-    projection: &[usize],
-    pruning_predicate: &Option<PruningPredicate>,
-    batch_size: usize,
-    response_tx: Sender<ArrowResult<RecordBatch>>,
-    limit: Option<usize>,
-    mut partition_column_projector: PartitionColumnProjector,
-) -> Result<()> {
-    let mut total_rows = 0;
-    'outer: for partitioned_file in partition {
-        debug!("Reading file {}", &partitioned_file.file_meta.path());
-
-        let file_metrics = ParquetFileMetrics::new(
-            partition_index,
-            &*partitioned_file.file_meta.path(),
-            &metrics,
-        );
-        let object_reader =
-            object_store.file_reader(partitioned_file.file_meta.sized_file.clone())?;
-
-        let mut opt = ReadOptionsBuilder::new();
-        if let Some(pruning_predicate) = pruning_predicate {
-            opt = opt.with_predicate(build_row_group_predicate(
-                pruning_predicate,
-                file_metrics,
-            ));
-        }
-
-        let file_reader = SerializedFileReader::new_with_options(
-            ChunkObjectReader(object_reader),
-            opt.build(),
-        )?;
-
-        let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
-        let adapted_projections =
-            schema_adapter.map_projections(&arrow_reader.get_schema()?, projection)?;
-
-        let mut batch_reader =
-            arrow_reader.get_record_reader_by_columns(adapted_projections, batch_size)?;
-        loop {
-            match batch_reader.next() {
-                Some(Ok(batch)) => {
-                    total_rows += batch.num_rows();
-
-                    let adapted_batch = schema_adapter.adapt_batch(batch, projection)?;
-
-                    let proj_batch = partition_column_projector
-                        .project(adapted_batch, &partitioned_file.partition_values);
-
-                    send_result(&response_tx, proj_batch)?;
-                    if limit.map(|l| total_rows >= l).unwrap_or(false) {
-                        break 'outer;
-                    }
-                }
-                None => {
-                    break;
-                }
-                Some(Err(e)) => {
-                    let err_msg =
-                        format!("Error reading batch from {}: {}", partitioned_file, e);
-                    // send error to operator
-                    send_result(
-                        &response_tx,
-                        Err(ArrowError::ParquetError(err_msg.clone())),
-                    )?;
-                    // terminate thread with error
-                    return Err(DataFusionError::Execution(err_msg));
-                }
-            }
-        }
-    }
-
-    // finished reading files (dropping response_tx will close
-    // channel)
-    Ok(())
-}
-
 /// Executes a query and writes the results to a partitioned Parquet file.
 pub async fn plan_to_parquet(
     state: &SessionState,
@@ -544,14 +537,15 @@ pub async fn plan_to_parquet(
                 )?;
                 let task_ctx = Arc::new(TaskContext::from(state));
                 let stream = plan.execute(i, task_ctx).await?;
-                let handle: JoinHandle<Result<()>> = task::spawn(async move {
-                    stream
-                        .map(|batch| writer.write(&batch?))
-                        .try_collect()
-                        .await
-                        .map_err(DataFusionError::from)?;
-                    writer.close().map_err(DataFusionError::from).map(|_| ())
-                });
+                let handle: tokio::task::JoinHandle<Result<()>> =
+                    tokio::task::spawn(async move {
+                        stream
+                            .map(|batch| writer.write(&batch?))
+                            .try_collect()
+                            .await
+                            .map_err(DataFusionError::from)?;
+                        writer.close().map_err(DataFusionError::from).map(|_| ())
+                    });
                 tasks.push(handle);
             }
             futures::future::join_all(tasks).await;
