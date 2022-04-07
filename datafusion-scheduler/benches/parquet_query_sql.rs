@@ -200,12 +200,17 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     let scheduler = Scheduler::new(partitions);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let local_rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    let query_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(partitions)
         .build()
         .unwrap();
 
-    rt.block_on(context.register_parquet("t", file_path.as_str()))
+    local_rt
+        .block_on(context.register_parquet("t", file_path.as_str()))
         .unwrap();
 
     // We read the queries from a file so they can be changed without recompiling the benchmark
@@ -225,28 +230,40 @@ fn criterion_benchmark(c: &mut Criterion) {
             continue;
         }
 
-        let query = query.as_str();
         c.bench_function(&format!("tokio: {}", query), |b| {
             b.iter(|| {
+                let query = query.clone();
                 let mut context = context.clone();
-                rt.block_on(async move {
-                    let query = context.sql(query).await.unwrap();
+                let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+
+                // Spawn work to a separate tokio thread pool
+                query_rt.spawn(async move {
+                    let query = context.sql(&query).await.unwrap();
                     let mut stream = query.execute_stream().await.unwrap();
-                    while stream.next().await.transpose().unwrap().is_some() {}
+
+                    while let Some(next) = stream.next().await {
+                        sender.unbounded_send(next).unwrap();
+                    }
+                });
+
+                local_rt.block_on(async {
+                    while receiver.next().await.transpose().unwrap().is_some() {}
                 })
             });
         });
 
         c.bench_function(&format!("scheduled: {}", query), |b| {
             b.iter(|| {
+                let query = query.clone();
                 let mut context = context.clone();
-                rt.block_on(async {
-                    let query = context.sql(query).await.unwrap();
+
+                local_rt.block_on(async {
+                    let query = context.sql(&query).await.unwrap();
                     let plan = query.create_physical_plan().await.unwrap();
                     let mut stream =
                         scheduler.schedule_plan(plan, context.task_ctx()).unwrap();
                     while stream.next().await.transpose().unwrap().is_some() {}
-                })
+                });
             });
         });
     }

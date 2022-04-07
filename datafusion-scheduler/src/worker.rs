@@ -161,9 +161,12 @@ impl WorkerPool {
                     shared: shared.clone(),
                 };
 
-                WorkerThread {
-                    handle: std::thread::spawn(move || state.run()),
-                }
+                let handle = std::thread::Builder::new()
+                    .name(format!("df-worker-{}", idx))
+                    .spawn(move || state.run())
+                    .unwrap();
+
+                WorkerThread { handle }
             })
             .collect();
 
