@@ -118,7 +118,7 @@ mod tests {
         let mut rng = thread_rng();
 
         let batches_per_partition = 3;
-        let rows_per_batch = 5;
+        let rows_per_batch = 100;
         let num_partitions = 2;
 
         let mut id_offset = 0;
@@ -156,7 +156,10 @@ mod tests {
             "select * from table1 order by id",
             "select * from table1 where table1.a > 100 order by id",
             "select distinct a from table1 where table1.b > 100 order by a",
-            "select * from table1 join table2 on table1.id = table2.id order by table1.id"
+            "select * from table1 join table2 on table1.id = table2.id order by table1.id",
+            "select id from table1 union all select id from table2 order by id",
+            "select id from table1 union all select id from table2 where a > 100 order by id",
+            "select * from (select id, b from table1 union all select id, b from table2 where a > 100 order by id) as t where b > 10",
         ];
 
         for sql in queries {
