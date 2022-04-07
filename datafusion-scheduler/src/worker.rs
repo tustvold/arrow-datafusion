@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crossbeam_deque::Steal;
+use log::{debug, error, info, trace};
 use parking_lot::{Condvar, Mutex};
 
 use crate::WorkItem;
@@ -26,7 +27,7 @@ thread_local! {
 /// Spawns a [`WorkItem`] to the worker local queue
 pub fn spawn_local(item: WorkItem) {
     ThreadState::local(|s| {
-        println!("Spawning {:?} to local worker {}", item, s.idx);
+        trace!("Spawning {:?} to local worker {}", item, s.idx);
         s.local.push(item)
     })
 }
@@ -34,14 +35,14 @@ pub fn spawn_local(item: WorkItem) {
 impl ThreadState {
     fn find_task(&self) -> Option<WorkItem> {
         if let Some(item) = self.local.pop() {
-            println!("Worker {} fetched {:?} from local queue", self.idx, item);
+            trace!("Worker {} fetched {:?} from local queue", self.idx, item);
             return Some(item);
         }
 
         loop {
             match self.shared.injector.steal_batch_and_pop(&self.local) {
                 Steal::Success(item) => {
-                    println!("Worker {} fetched {:?} from injector", self.idx, item);
+                    trace!("Worker {} fetched {:?} from injector", self.idx, item);
                     return Some(item);
                 }
                 Steal::Retry => continue,
@@ -52,9 +53,11 @@ impl ThreadState {
             for (idx, steal) in &self.steal {
                 match steal.steal() {
                     Steal::Success(item) => {
-                        println!(
+                        trace!(
                             "Worker {} stole {:?} from worker {}",
-                            self.idx, item, idx
+                            self.idx,
+                            item,
+                            idx
                         );
                         return Some(item);
                     }
@@ -63,7 +66,7 @@ impl ThreadState {
                 }
             }
 
-            println!("Worker {} failed to find any work", self.idx);
+            trace!("Worker {} failed to find any work", self.idx);
             return None;
         }
     }
@@ -86,7 +89,7 @@ impl ThreadState {
                 Some(task) => task.do_work(),
                 None => {
                     if !Self::wait_for_input(worker_idx, &shared) {
-                        println!("Worker {} shutting down", worker_idx);
+                        info!("Worker {} shutting down", worker_idx);
                         break;
                     }
                 }
@@ -101,9 +104,9 @@ impl ThreadState {
             return false;
         }
 
-        println!("Worker {} entered sleep", worker_idx);
+        debug!("Worker {} entered sleep", worker_idx);
         shared.signal.wait(&mut lock);
-        println!("Worker {} exited sleep", worker_idx);
+        debug!("Worker {} exited sleep", worker_idx);
 
         !lock.is_shutdown
     }
@@ -174,13 +177,13 @@ impl WorkerPool {
     }
 
     pub fn shutdown(&mut self) {
-        println!("Shutting down worker pool");
+        info!("Shutting down worker pool");
         self.shared.inner.lock().is_shutdown = true;
         self.shared.signal.notify_all();
 
         for (idx, worker) in self.workers.drain(..).enumerate() {
             if let Err(_) = worker.handle.join() {
-                panic!("worker {} panicked", idx)
+                error!("worker {} panicked", idx)
             }
         }
     }
@@ -193,7 +196,7 @@ pub struct Spawner {
 
 impl Spawner {
     pub fn spawn(&self, task: WorkItem) {
-        println!("Spawning {:?} to any worker", task);
+        debug!("Spawning {:?} to any worker", task);
         self.shared.injector.push(task);
 
         // Ensure that at least one worker thread is awake

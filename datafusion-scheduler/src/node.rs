@@ -8,6 +8,7 @@ use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
+use log::trace;
 use parking_lot::Mutex;
 
 use crate::query::Node;
@@ -137,7 +138,7 @@ impl Node for ExecutionNode {
     }
 
     fn close(&self, child: usize, partition: usize) {
-        println!("Closing child: {}, partition: {}", child, partition);
+        trace!("Closing child: {}, partition: {}", child, partition);
         let mut partition = self.inputs[child][partition].lock();
         assert!(!partition.is_closed);
 

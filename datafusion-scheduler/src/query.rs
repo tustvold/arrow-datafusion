@@ -3,6 +3,7 @@ use std::task::{Context, Poll};
 
 use futures::channel::mpsc;
 use futures::task::ArcWake;
+use log::{debug, trace};
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
@@ -34,7 +35,7 @@ impl std::fmt::Debug for WorkItem {
 
 impl WorkItem {
     pub fn spawn_query(spawner: Spawner, query: Arc<Query>) {
-        println!("Spawning query: {:#?}", query);
+        debug!("Spawning query: {:#?}", query);
 
         for (node_idx, node) in query.nodes.iter().enumerate() {
             for partition in 0..node.node.output_partitions() {
@@ -64,19 +65,20 @@ impl WorkItem {
         let query_node = &self.query.nodes[node];
         match query_node.node.poll_partition(&mut cx, partition) {
             Poll::Ready(Some(Ok(batch))) => {
-                println!("Poll {:?}: Ok: {}", self, batch.num_rows());
+                trace!("Poll {:?}: Ok: {}", self, batch.num_rows());
                 match query_node.parent {
                     Some(link) => {
-                        println!(
+                        trace!(
                             "Published batch to node {:?} partition {}",
-                            link, partition
+                            link,
+                            partition
                         );
                         self.query.nodes[link.node]
                             .node
                             .push(batch, link.child, partition)
                     }
                     None => {
-                        println!("Published batch to output");
+                        trace!("Published batch to output");
                         let _ = self.query.output.unbounded_send(Ok(batch));
                     }
                 }
@@ -88,7 +90,7 @@ impl WorkItem {
                 });
             }
             Poll::Ready(Some(Err(e))) => {
-                println!("Poll {:?}: Error: {:?}", self, e);
+                trace!("Poll {:?}: Error: {:?}", self, e);
                 let _ = self.query.output.unbounded_send(Err(e));
                 if let Some(link) = query_node.parent {
                     self.query.nodes[link.node]
@@ -97,14 +99,14 @@ impl WorkItem {
                 }
             }
             Poll::Ready(None) => {
-                println!("Poll {:?}: None", self);
+                trace!("Poll {:?}: None", self);
                 if let Some(link) = query_node.parent {
                     self.query.nodes[link.node]
                         .node
                         .close(link.child, partition)
                 }
             }
-            Poll::Pending => println!("Poll {:?}: Pending", self),
+            Poll::Pending => trace!("Poll {:?}: Pending", self),
         }
     }
 }
@@ -122,10 +124,10 @@ impl ArcWake for WorkItemWaker {
                 query,
                 waker: self.clone(),
             };
-            println!("Wakeup {:?}", item);
+            trace!("Wakeup {:?}", item);
             spawn_local(item)
         } else {
-            println!("Dropped wakeup");
+            trace!("Dropped wakeup");
         }
     }
 
@@ -173,7 +175,7 @@ pub struct Query {
 
 impl Drop for Query {
     fn drop(&mut self) {
-        println!("Query dropped");
+        debug!("Query finished");
     }
 }
 
