@@ -10,29 +10,46 @@ use crate::WorkItem;
 
 #[derive(Debug)]
 struct WorkerThread {
-    handle: JoinHandle<()>,
+    signal: Condvar,
+    state: Mutex<WorkerThreadState>,
+    stealer: crossbeam_deque::Stealer<WorkItem>,
 }
 
-struct ThreadState {
+impl WorkerThread {
+    pub fn wake(&self) {
+        self.signal.notify_one();
+    }
+
+    pub fn shutdown(&self) {
+        self.state.lock().is_shutdown = true;
+        self.signal.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct WorkerThreadState {
+    is_shutdown: bool,
+}
+
+struct WorkerThreadLocalState {
     idx: usize,
-    shared: Arc<SharedState>,
+    pool: Arc<PoolState>,
     local: crossbeam_deque::Worker<WorkItem>,
-    steal: Vec<(usize, crossbeam_deque::Stealer<WorkItem>)>,
 }
 
 thread_local! {
-    static CURRENT_THREAD: RefCell<Option<ThreadState>> = RefCell::new(None)
+    static CURRENT_THREAD: RefCell<Option<WorkerThreadLocalState>> = RefCell::new(None)
 }
 
 /// Spawns a [`WorkItem`] to the worker local queue
 pub fn spawn_local(item: WorkItem) {
-    ThreadState::local(|s| {
+    WorkerThreadLocalState::local(|s| {
         trace!("Spawning {:?} to local worker {}", item, s.idx);
         s.local.push(item)
     })
 }
 
-impl ThreadState {
+impl WorkerThreadLocalState {
     fn find_task(&self) -> Option<WorkItem> {
         if let Some(item) = self.local.pop() {
             trace!("Worker {} fetched {:?} from local queue", self.idx, item);
@@ -40,7 +57,7 @@ impl ThreadState {
         }
 
         loop {
-            match self.shared.injector.steal_batch_and_pop(&self.local) {
+            match self.pool.injector.steal_batch_and_pop(&self.local) {
                 Steal::Success(item) => {
                     trace!("Worker {} fetched {:?} from injector", self.idx, item);
                     return Some(item);
@@ -50,8 +67,12 @@ impl ThreadState {
             }
 
             // TODO: Should the search order be randomized?
-            for (idx, steal) in &self.steal {
-                match steal.steal() {
+            for (idx, worker) in self.pool.workers.iter().enumerate() {
+                if idx == self.idx {
+                    continue
+                }
+
+                match worker.stealer.steal() {
                     Steal::Success(item) => {
                         trace!(
                             "Worker {} stole {:?} from worker {}",
@@ -79,7 +100,7 @@ impl ThreadState {
     }
 
     fn run(self) {
-        let shared = self.shared.clone();
+        let pool = self.pool.clone();
         let worker_idx = self.idx;
 
         CURRENT_THREAD.with(|s| *s.borrow_mut() = Some(self));
@@ -88,7 +109,7 @@ impl ThreadState {
             match Self::local(Self::find_task) {
                 Some(task) => task.do_work(),
                 None => {
-                    if !Self::wait_for_input(worker_idx, &shared) {
+                    if !pool.wait_for_input(worker_idx) {
                         info!("Worker {} shutting down", worker_idx);
                         break;
                     }
@@ -96,96 +117,95 @@ impl ThreadState {
             }
         }
     }
+}
 
+#[derive(Debug)]
+struct PoolState {
+    injector: crossbeam_deque::Injector<WorkItem>,
+    workers: Vec<WorkerThread>,
+}
+
+impl PoolState {
     /// Park this thread, returning false if this worker should terminate
-    fn wait_for_input(worker_idx: usize, shared: &SharedState) -> bool {
-        let mut lock = shared.inner.lock();
-        if lock.is_shutdown {
+    fn wait_for_input(&self, worker_idx: usize) -> bool {
+        let worker = &self.workers[worker_idx];
+
+        let mut state = worker.state.lock();
+        if state.is_shutdown {
             return false;
         }
 
         debug!("Worker {} entered sleep", worker_idx);
-        shared.signal.wait(&mut lock);
+        worker.signal.wait(&mut state);
         debug!("Worker {} exited sleep", worker_idx);
 
-        !lock.is_shutdown
+        !state.is_shutdown
     }
-}
-
-#[derive(Debug)]
-struct SharedState {
-    injector: crossbeam_deque::Injector<WorkItem>,
-    signal: Condvar,
-    inner: Arc<Mutex<SharedStateInner>>,
-}
-
-#[derive(Debug)]
-struct SharedStateInner {
-    is_shutdown: bool,
 }
 
 #[derive(Debug)]
 pub struct WorkerPool {
-    shared: Arc<SharedState>,
-    workers: Vec<WorkerThread>,
+    pool: Arc<PoolState>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 impl WorkerPool {
     pub fn new(workers: usize) -> Self {
-        let shared = Arc::new(SharedState {
-            injector: crossbeam_deque::Injector::new(),
-            signal: Default::default(),
-            inner: Arc::new(Mutex::new(SharedStateInner { is_shutdown: false })),
-        });
-
         let worker_queues: Vec<_> = (0..workers)
             .map(|_| crossbeam_deque::Worker::new_fifo())
             .collect();
-        let stealers: Vec<_> = worker_queues.iter().map(|x| x.stealer()).collect();
 
-        let workers = worker_queues
-            .into_iter()
-            .enumerate()
-            .map(|(idx, local)| {
-                let steal = stealers
-                    .iter()
-                    .enumerate()
-                    .filter(|(steal_idx, _)| *steal_idx != idx)
-                    .map(|(steal_idx, steal)| (steal_idx, steal.clone()))
-                    .collect();
-
-                let state = ThreadState {
-                    idx,
-                    local,
-                    steal,
-                    shared: shared.clone(),
-                };
-
-                let handle = std::thread::Builder::new()
-                    .name(format!("df-worker-{}", idx))
-                    .spawn(move || state.run())
-                    .unwrap();
-
-                WorkerThread { handle }
+        let worker_threads: Vec<_> = worker_queues
+            .iter()
+            .map(|queue| WorkerThread {
+                signal: Default::default(),
+                state: Mutex::new(WorkerThreadState { is_shutdown: false }),
+                stealer: queue.stealer(),
             })
             .collect();
 
-        WorkerPool { shared, workers }
+        let pool = Arc::new(PoolState {
+            injector: crossbeam_deque::Injector::new(),
+            workers: worker_threads,
+        });
+
+        let handles = worker_queues
+            .into_iter()
+            .enumerate()
+            .map(|(idx, local)| {
+                let state = WorkerThreadLocalState {
+                    idx,
+                    local,
+                    pool: pool.clone(),
+                };
+
+                std::thread::Builder::new()
+                    .name(format!("df-worker-{}", idx))
+                    .spawn(move || state.run())
+                    .unwrap()
+            })
+            .collect();
+
+        WorkerPool {
+            pool,
+            handles,
+        }
     }
 
     pub fn spawner(&self) -> Spawner {
         Spawner {
-            shared: self.shared.clone(),
+            pool: self.pool.clone(),
         }
     }
 
     pub fn shutdown(&mut self) {
         info!("Shutting down worker pool");
-        self.shared.inner.lock().is_shutdown = true;
-        self.shared.signal.notify_all();
+        for worker in &self.pool.workers {
+            worker.shutdown();
+        }
 
-        for (idx, worker) in self.workers.drain(..).enumerate() {
-            if let Err(_) = worker.handle.join() {
+        for (idx, handle) in self.handles.drain(..).enumerate() {
+            if let Err(_) = handle.join() {
                 error!("worker {} panicked", idx)
             }
         }
@@ -194,15 +214,16 @@ impl WorkerPool {
 
 #[derive(Debug, Clone)]
 pub struct Spawner {
-    shared: Arc<SharedState>,
+    pool: Arc<PoolState>,
 }
 
 impl Spawner {
     pub fn spawn(&self, task: WorkItem) {
         debug!("Spawning {:?} to any worker", task);
-        self.shared.injector.push(task);
+        self.pool.injector.push(task);
 
-        // Ensure that at least one worker thread is awake
-        self.shared.signal.notify_one();
+        // TODO: More sophisticated wakeup policy
+        // NB: THIS WILL CURRENTLY RESULT IN ONLY A SINGLE THREAD RUNNING
+        self.pool.workers.first().unwrap().wake();
     }
 }
