@@ -29,7 +29,6 @@ impl RepartitionNode {
 
         let state = Mutex::new(RepartitionState {
             next_idx: 0,
-            random_state: Default::default(),
             hash_buffer: vec![],
             partition_closed: vec![false; input_count],
             input_closed: false,
@@ -45,7 +44,6 @@ impl RepartitionNode {
 struct RepartitionState {
     // TODO: Split this into an enum based on output type
     next_idx: usize,
-    random_state: ahash::RandomState,
     hash_buffer: Vec<u64>,
     partition_closed: Vec<bool>,
     input_closed: bool,
@@ -76,9 +74,12 @@ impl RepartitionState {
         self.hash_buffer.clear();
         self.hash_buffer.resize(input.num_rows(), 0);
 
+        // Use a fixed random state
+        let random_state = ahash::RandomState::with_seeds(0, 0, 0, 0);
+
         datafusion::physical_plan::hash_utils::create_hashes(
             &arrays,
-            &self.random_state,
+            &random_state,
             &mut self.hash_buffer,
         )?;
 

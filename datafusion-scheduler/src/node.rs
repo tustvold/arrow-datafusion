@@ -105,7 +105,7 @@ impl Node for ExecutionNode {
     }
 
     fn close(&self, child: usize, partition: usize) {
-        println!("Closing partition: {}", partition);
+        println!("Closing child: {}, partition: {}", child, partition);
         let mut partition = self.inputs[child][partition].lock();
         assert!(!partition.is_closed);
 

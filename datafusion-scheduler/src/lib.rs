@@ -95,11 +95,16 @@ mod tests {
         })))
     }
 
-    fn generate_batch<R: Rng>(rng: &mut R, row_count: usize) -> RecordBatch {
+    fn generate_batch<R: Rng>(
+        rng: &mut R,
+        row_count: usize,
+        id_offset: i32,
+    ) -> RecordBatch {
+        let id_range = id_offset..(row_count as i32 + id_offset);
         let a = generate_primitive::<Int32Type, _>(rng, row_count, 0.5, 0..1000);
         let b = generate_primitive::<Float64Type, _>(rng, row_count, 0.5, 0. ..1000.);
-        let c = PrimitiveArray::<Int32Type>::from_iter_values(0..row_count as i32);
-        RecordBatch::try_from_iter([("a", a), ("b", b), ("c", Arc::new(c))]).unwrap()
+        let id = PrimitiveArray::<Int32Type>::from_iter_values(id_range);
+        RecordBatch::try_from_iter([("a", a), ("b", b), ("id", Arc::new(id))]).unwrap()
     }
 
     fn make_batches() -> Vec<Vec<RecordBatch>> {
@@ -109,15 +114,19 @@ mod tests {
         let rows_per_batch = 1000;
         let num_partitions = 2;
 
-        std::iter::from_fn(|| {
-            Some(
-                std::iter::from_fn(|| Some(generate_batch(&mut rng, rows_per_batch)))
-                    .take(batches_per_partition)
-                    .collect(),
-            )
-        })
-        .take(num_partitions)
-        .collect()
+        let mut id_offset = 0;
+
+        (0..num_partitions)
+            .map(|_| {
+                (0..batches_per_partition)
+                    .map(|_| {
+                        let batch = generate_batch(&mut rng, rows_per_batch, id_offset);
+                        id_offset += rows_per_batch as i32;
+                        batch
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     fn make_provider() -> Arc<dyn TableProvider> {
@@ -137,9 +146,10 @@ mod tests {
         context.register_table("table2", make_provider()).unwrap();
 
         let queries = [
-            "select * from table1 order by a, b, c",
-            "select * from table1 where table1.a > 100 order by a, b, c",
+            "select * from table1 order by id",
+            "select * from table1 where table1.a > 100 order by id",
             "select distinct a from table1 where table1.b > 100 order by a",
+            "select * from table1 join table2 on table1.id = table2.id order by table1.id"
         ];
 
         for sql in queries {
