@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
@@ -35,7 +34,7 @@ impl std::fmt::Debug for WorkItem {
 
 impl WorkItem {
     pub fn spawn_query(spawner: Spawner, query: Arc<Query>) {
-        println!("Spawning query: {:?}", query);
+        println!("Spawning query: {:#?}", query);
 
         for (node_idx, node) in query.nodes.iter().enumerate() {
             for partition in 0..node.node.output_partitions() {
@@ -154,7 +153,7 @@ pub trait Node: Send + Sync + std::fmt::Debug {
     ) -> Poll<Option<ArrowResult<RecordBatch>>>;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ParentLink {
     node: usize,
     child: usize,
@@ -183,51 +182,168 @@ impl Query {
         plan: Arc<dyn ExecutionPlan>,
         task_context: Arc<TaskContext>,
     ) -> Result<(Query, mpsc::UnboundedReceiver<ArrowResult<RecordBatch>>)> {
-        let mut nodes = Vec::new();
-        let mut dequeue = VecDeque::new();
-        dequeue.push_back((plan, None));
+        QueryBuilder::new(plan, task_context).build()
+    }
+}
 
-        // TODO: Group non-pipeline breaking operations into a single ExecutionNode
+struct ExecGroup {
+    parent: Option<ParentLink>,
+    root: Arc<dyn ExecutionPlan>,
+    depth: usize,
+}
 
-        while let Some((plan, parent)) = dequeue.pop_front() {
-            let children = plan.children();
-            dequeue.extend(children.into_iter().enumerate().map(|(child, plan)| {
-                let parent = ParentLink {
-                    node: nodes.len(),
-                    child,
-                };
-                (plan, Some(parent))
-            }));
+struct QueryBuilder {
+    nodes: Vec<QueryNode>,
+    task_context: Arc<TaskContext>,
+    to_visit: Vec<(Arc<dyn ExecutionPlan>, Option<ParentLink>)>,
+    exec_buffer: Option<ExecGroup>,
+}
 
-            let operator = if let Some(repartition) =
-                plan.as_any().downcast_ref::<RepartitionExec>()
-            {
-                Box::new(RepartitionNode::new(
-                    repartition.input().output_partitioning(),
-                    repartition.output_partitioning(),
-                )) as Box<dyn Node>
-            } else if let Some(coalesce) =
-                plan.as_any().downcast_ref::<CoalescePartitionsExec>()
-            {
-                Box::new(RepartitionNode::new(
-                    coalesce.input().output_partitioning(),
-                    Partitioning::RoundRobinBatch(1),
-                )) as Box<dyn Node>
-            } else {
-                let node = ExecutionNode::new(plan, task_context.clone())?;
-                Box::new(node) as Box<dyn Node>
-            };
+impl QueryBuilder {
+    fn new(plan: Arc<dyn ExecutionPlan>, task_context: Arc<TaskContext>) -> Self {
+        Self {
+            nodes: vec![],
+            to_visit: vec![(plan, None)],
+            task_context,
+            exec_buffer: None,
+        }
+    }
 
-            nodes.push(QueryNode {
-                node: operator,
+    fn flush_exec(&mut self) -> Result<usize> {
+        let group = self.exec_buffer.take().unwrap();
+        let node_idx = self.nodes.len();
+        self.nodes.push(QueryNode {
+            node: Box::new(ExecutionNode::new(
+                group.root,
+                self.task_context.clone(),
+                group.depth,
+            )?),
+            parent: group.parent,
+        });
+        Ok(node_idx)
+    }
+
+    fn visit_exec(
+        &mut self,
+        plan: Arc<dyn ExecutionPlan>,
+        parent: Option<ParentLink>,
+    ) -> Result<()> {
+        let children = plan.children();
+
+        match self.exec_buffer.as_mut() {
+            Some(buffer) => {
+                assert_eq!(parent, buffer.parent, "QueryBuilder out of sync");
+                buffer.depth += 1;
+            }
+            None => {
+                self.exec_buffer = Some(ExecGroup {
+                    parent,
+                    root: plan,
+                    depth: 0,
+                })
+            }
+        }
+
+        match children.len() {
+            1 => self
+                .to_visit
+                .push((children.into_iter().next().unwrap(), parent)),
+            _ => {
+                let node = self.flush_exec()?;
+                self.enqueue_children(children, node);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn enqueue_children(
+        &mut self,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        parent_node_idx: usize,
+    ) {
+        for (child_idx, child) in children.into_iter().enumerate() {
+            self.to_visit.push((
+                child,
+                Some(ParentLink {
+                    node: parent_node_idx,
+                    child: child_idx,
+                }),
+            ))
+        }
+    }
+
+    fn push_node(&mut self, node: QueryNode, children: Vec<Arc<dyn ExecutionPlan>>) {
+        let node_idx = self.nodes.len();
+        self.nodes.push(node);
+        self.enqueue_children(children, node_idx)
+    }
+
+    fn push_repartition(
+        &mut self,
+        input: Partitioning,
+        output: Partitioning,
+        parent: Option<ParentLink>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<()> {
+        let parent = match &self.exec_buffer {
+            Some(buffer) => {
+                assert_eq!(buffer.parent, parent, "QueryBuilder out of sync");
+                Some(ParentLink {
+                    node: self.flush_exec()?,
+                    child: 0, // Must be the only child
+                })
+            }
+            None => parent,
+        };
+
+        let node = Box::new(RepartitionNode::new(input, output));
+        self.push_node(QueryNode { node, parent }, children);
+        Ok(())
+    }
+
+    fn visit_node(
+        &mut self,
+        plan: Arc<dyn ExecutionPlan>,
+        parent: Option<ParentLink>,
+    ) -> Result<()> {
+        if let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>() {
+            self.push_repartition(
+                repartition.input().output_partitioning(),
+                repartition.output_partitioning(),
                 parent,
-            });
+                repartition.children(),
+            )
+        } else if let Some(coalesce) =
+            plan.as_any().downcast_ref::<CoalescePartitionsExec>()
+        {
+            self.push_repartition(
+                coalesce.input().output_partitioning(),
+                Partitioning::RoundRobinBatch(1),
+                parent,
+                coalesce.children(),
+            )
+        } else {
+            self.visit_exec(plan, parent)
+        }
+    }
+
+    fn build(
+        mut self,
+    ) -> Result<(Query, mpsc::UnboundedReceiver<ArrowResult<RecordBatch>>)> {
+        // We do a depth-first scan of the operator tree, extracting a list of [`QueryNode`]
+        while let Some((plan, parent)) = self.to_visit.pop() {
+            self.visit_node(plan, parent)?;
+        }
+
+        if self.exec_buffer.is_some() {
+            self.flush_exec()?;
         }
 
         let (sender, receiver) = mpsc::unbounded();
         Ok((
             Query {
-                nodes,
+                nodes: self.nodes,
                 output: sender,
             },
             receiver,

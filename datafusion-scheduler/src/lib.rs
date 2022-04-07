@@ -63,6 +63,7 @@ impl Drop for Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use arrow::util::pretty::pretty_format_batches;
     use std::ops::Range;
 
     use futures::TryStreamExt;
@@ -104,14 +105,20 @@ mod tests {
         let a = generate_primitive::<Int32Type, _>(rng, row_count, 0.5, 0..1000);
         let b = generate_primitive::<Float64Type, _>(rng, row_count, 0.5, 0. ..1000.);
         let id = PrimitiveArray::<Int32Type>::from_iter_values(id_range);
-        RecordBatch::try_from_iter([("a", a), ("b", b), ("id", Arc::new(id))]).unwrap()
+
+        RecordBatch::try_from_iter_with_nullable([
+            ("a", a, true),
+            ("b", b, true),
+            ("id", Arc::new(id), false),
+        ])
+        .unwrap()
     }
 
     fn make_batches() -> Vec<Vec<RecordBatch>> {
         let mut rng = thread_rng();
 
         let batches_per_partition = 3;
-        let rows_per_batch = 1000;
+        let rows_per_batch = 5;
         let num_partitions = 2;
 
         let mut id_offset = 0;
@@ -171,7 +178,14 @@ mod tests {
 
             println!("Query \"{}\" produced {} rows", sql, total_expected);
 
-            assert_eq!(scheduled, expected);
+            let expected = pretty_format_batches(&expected).unwrap().to_string();
+            let scheduled = pretty_format_batches(&scheduled).unwrap().to_string();
+
+            assert_eq!(
+                expected, scheduled,
+                "\n\nexpected:\n\n{}\nactual:\n\n{}\n\n",
+                expected, scheduled
+            );
         }
     }
 }

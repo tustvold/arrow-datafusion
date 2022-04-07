@@ -23,18 +23,20 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 
-/// An [`ExecutionNode`] wraps a single node within an [`ExecutionPlan`] and
+/// An [`ExecutionNode`] wraps a portion of an [`ExecutionPlan`] and
 /// converts it to a push-based API that can be orchestrated by a [`super::Scheduler`]
 ///
 /// This is hopefully a temporary hack, pending reworking the [`ExecutionPlan`] trait
 pub struct ExecutionNode {
+    proxied: Arc<dyn ExecutionPlan>,
     inputs: Vec<Vec<Arc<Mutex<InputPartition>>>>,
     outputs: Vec<Mutex<BoxStream<'static, ArrowResult<RecordBatch>>>>,
 }
 
 impl std::fmt::Debug for ExecutionNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExecutionNode").finish()
+        let tree = debug_tree(self.proxied.as_ref());
+        f.debug_tuple("ExecutionNode").field(&tree).finish()
     }
 }
 
@@ -42,11 +44,28 @@ impl ExecutionNode {
     pub fn new(
         plan: Arc<dyn ExecutionPlan>,
         task_context: Arc<TaskContext>,
+        depth: usize,
     ) -> Result<Self> {
-        let children = plan.children();
+        // The point in the plan at which to splice the plan graph
+        let mut splice_point = plan;
+        let mut parent_plans = Vec::with_capacity(depth.saturating_sub(1));
+        for _ in 0..depth {
+            let children = splice_point.children();
+            assert_eq!(
+                children.len(),
+                1,
+                "can only group through nodes with a single child"
+            );
+            parent_plans.push(splice_point);
+            splice_point = children.into_iter().next().unwrap();
+        }
+
+        // The children to replace with [`ProxyExecutionPlan`]
+        let children = splice_point.children();
         let mut inputs = Vec::with_capacity(children.len());
 
-        let proxied = if !children.is_empty() {
+        // The spliced plan with its children replaced with [`ProxyExecutionPlan`]
+        let spliced = if !children.is_empty() {
             let mut proxies: Vec<Arc<dyn ExecutionPlan>> =
                 Vec::with_capacity(children.len());
 
@@ -65,13 +84,18 @@ impl ExecutionNode {
                 }));
             }
 
-            plan.with_new_children(proxies)?
+            splice_point.with_new_children(proxies)?
         } else {
-            plan.clone()
+            splice_point.clone()
         };
 
-        // This somewhat perverse construction is necessary to handle operators that perform
-        // computation with `ExecutionPlan::execute`
+        // Reconstruct the parent graph
+        let mut proxied = spliced;
+        for parent in parent_plans.into_iter().rev() {
+            proxied = parent.with_new_children(vec![proxied])?
+        }
+
+        // Construct the output streams
         let output_count = proxied.output_partitioning().partition_count();
         let outputs = (0..output_count)
             .map(|x| {
@@ -84,11 +108,19 @@ impl ExecutionNode {
                         .map_err(|e| ArrowError::ExternalError(Box::new(e)))
                 };
 
+                // Use futures::stream::once to handle operators that perform computation
+                // within `ExecutionPlan::execute`. If we evaluated these futures here
+                // we could potentially block indefinitely waiting for inputs that will
+                // never arrive as the query isn't scheduled yet
                 Mutex::new(futures::stream::once(fut).try_flatten().boxed())
             })
             .collect();
 
-        Ok(Self { inputs, outputs })
+        Ok(Self {
+            proxied,
+            inputs,
+            outputs,
+        })
     }
 }
 
@@ -209,7 +241,7 @@ impl ExecutionPlan for ProxyExecutionPlan {
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        vec![]
     }
 
     fn with_new_children(
@@ -234,11 +266,51 @@ impl ExecutionPlan for ProxyExecutionPlan {
         self.inner.metrics()
     }
 
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        self.inner.fmt_as(t, f)
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "ProxyExecutionPlan")
     }
 
     fn statistics(&self) -> Statistics {
         self.inner.statistics()
     }
+}
+
+struct NodeDescriptor {
+    operator: String,
+    children: Vec<NodeDescriptor>,
+}
+
+impl std::fmt::Debug for NodeDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(&self.operator)
+            .field("children", &self.children)
+            .finish()
+    }
+}
+
+fn debug_tree(plan: &dyn ExecutionPlan) -> NodeDescriptor {
+    let operator = format!("{}", one_line(plan));
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|x| debug_tree(x.as_ref()))
+        .collect();
+
+    NodeDescriptor { operator, children }
+}
+
+/// Return a `Display`able structure that produces a single line, for
+/// this node only (does not recurse to children)
+fn one_line(plan: &dyn ExecutionPlan) -> impl std::fmt::Display + '_ {
+    struct Wrapper<'a> {
+        plan: &'a dyn ExecutionPlan,
+    }
+    impl<'a> std::fmt::Display for Wrapper<'a> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let t = DisplayFormatType::Default;
+            self.plan.fmt_as(t, f)
+        }
+    }
+
+    Wrapper { plan }
 }
