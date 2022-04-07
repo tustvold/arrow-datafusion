@@ -159,7 +159,8 @@ mod tests {
             "select * from table1 join table2 on table1.id = table2.id order by table1.id",
             "select id from table1 union all select id from table2 order by id",
             "select id from table1 union all select id from table2 where a > 100 order by id",
-            "select * from (select id, b from table1 union all select id, b from table2 where a > 100 order by id) as t where b > 10",
+            "select id, b from (select id, b from table1 union all select id, b from table2 where a > 100 order by id) as t where b > 10 order by id, b",
+            "select id, MIN(b), MAX(b), AVG(b) from table1 group by id order by id"
         ];
 
         for sql in queries {
