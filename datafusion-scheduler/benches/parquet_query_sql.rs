@@ -24,7 +24,9 @@ use arrow::datatypes::{
 };
 use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, Criterion};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_scheduler::Scheduler;
+use futures::stream::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{WriterProperties, WriterVersion};
 use rand::distributions::uniform::SampleUniform;
@@ -37,8 +39,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
-use futures::stream::StreamExt;
-use datafusion_scheduler::Scheduler;
 
 /// The number of batches to write
 const NUM_BATCHES: usize = 2048;
@@ -194,11 +194,17 @@ fn criterion_benchmark(c: &mut Criterion) {
     assert!(Path::new(&file_path).exists(), "path not found");
     println!("Using parquet file {}", file_path);
 
-    let mut context = SessionContext::new();
+    let partitions = 4;
+    let config = SessionConfig::new().with_target_partitions(partitions);
+    let mut context = SessionContext::with_config(config);
 
-    let scheduler = Scheduler::new(2);
+    let scheduler = Scheduler::new(partitions);
 
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(partitions)
+        .build()
+        .unwrap();
+
     rt.block_on(context.register_parquet("t", file_path.as_str()))
         .unwrap();
 
@@ -237,7 +243,8 @@ fn criterion_benchmark(c: &mut Criterion) {
                 rt.block_on(async {
                     let query = context.sql(query).await.unwrap();
                     let plan = query.create_physical_plan().await.unwrap();
-                    let mut stream = scheduler.schedule_plan(plan, context.task_ctx()).unwrap();
+                    let mut stream =
+                        scheduler.schedule_plan(plan, context.task_ctx()).unwrap();
                     while stream.next().await.transpose().unwrap().is_some() {}
                 })
             });
