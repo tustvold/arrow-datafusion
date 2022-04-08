@@ -14,10 +14,7 @@ use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 
 use crate::node::ExecutionNode;
 use crate::repartition::RepartitionNode;
-use crate::{
-    worker::{spawn_local, Spawner},
-    ArrowResult,
-};
+use crate::{ArrowResult, spawn_local, Spawner};
 
 pub struct WorkItem {
     query: Arc<Query>,

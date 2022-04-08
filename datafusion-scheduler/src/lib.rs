@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt};
+use log::debug;
 
 use datafusion::arrow::error::Result as ArrowResult;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -26,21 +27,27 @@ use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::query::{Query, WorkItem};
-use crate::worker::WorkerPool;
+
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 mod node;
 mod query;
 mod repartition;
-mod worker;
 
 pub struct Scheduler {
-    pool: WorkerPool,
+    pool: Arc<ThreadPool>,
 }
 
 impl Scheduler {
     pub fn new(num_threads: usize) -> Self {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|idx| format!("df-worker-{}", idx))
+            .build()
+            .unwrap();
+
         Self {
-            pool: WorkerPool::new(num_threads),
+            pool: Arc::new(pool),
         }
     }
 
@@ -50,14 +57,30 @@ impl Scheduler {
         context: Arc<TaskContext>,
     ) -> Result<BoxStream<'static, ArrowResult<RecordBatch>>> {
         let (query, receiver) = Query::new(plan, context)?;
-        WorkItem::spawn_query(self.pool.spawner(), Arc::new(query));
+        WorkItem::spawn_query(self.spawner(), Arc::new(query));
         Ok(receiver.boxed())
+    }
+
+    fn spawner(&self) -> Spawner {
+        Spawner {
+            pool: self.pool.clone(),
+        }
     }
 }
 
-impl Drop for Scheduler {
-    fn drop(&mut self) {
-        self.pool.shutdown()
+fn spawn_local(item: WorkItem) {
+    rayon::spawn(|| item.do_work())
+}
+
+#[derive(Debug, Clone)]
+pub struct Spawner {
+    pool: Arc<ThreadPool>,
+}
+
+impl Spawner {
+    pub fn spawn(&self, task: WorkItem) {
+        debug!("Spawning {:?} to any worker", task);
+        self.pool.spawn(move || task.do_work());
     }
 }
 
