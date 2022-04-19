@@ -17,26 +17,27 @@
 
 [workspace]
 members = [
-    "datafusion",
-    "datafusion-common",
-    "datafusion-expr",
-    "datafusion-jit",
-    "datafusion-physical-expr",
-    "datafusion-cli",
+    "datafusion/core",
+    "datafusion/common",
+    "datafusion/expr",
+    "datafusion/jit",
+    "datafusion/physical-expr",
+    "datafusion/proto",
     "datafusion-examples",
-    "datafusion-proto",
     "benchmarks",
     "ballista/rust/client",
     "ballista/rust/core",
     "ballista/rust/executor",
     "ballista/rust/scheduler",
     "ballista-examples",
+    "data-access",
 ]
+exclude = ["datafusion-cli"]
 
 [profile.release]
 codegen-units = 1
 
 [patch.crates-io]
-arrow = { git = "https://github.com/tustvold/arrow-rs.git", rev = "b3e873a45cfca64605a39c366fd76b69964ef329", package = "arrow"}
-arrow-flight = { git = "https://github.com/tustvold/arrow-rs.git", rev = "b3e873a45cfca64605a39c366fd76b69964ef329", package = "arrow-flight"}
-parquet = { git = "https://github.com/tustvold/arrow-rs.git", rev = "b3e873a45cfca64605a39c366fd76b69964ef329", package = "parquet" }
+arrow = { git = "https://github.com/tustvold/arrow-rs.git", rev = "1ca00d19fa262c2711739f304b08da10b45d9db0", package = "arrow"}
+arrow-flight = { git = "https://github.com/tustvold/arrow-rs.git", rev = "1ca00d19fa262c2711739f304b08da10b45d9db0", package = "arrow-flight"}
+parquet = { git = "https://github.com/tustvold/arrow-rs.git", rev = "1ca00d19fa262c2711739f304b08da10b45d9db0", package = "parquet" }

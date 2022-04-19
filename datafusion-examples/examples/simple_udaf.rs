@@ -23,9 +23,8 @@ use datafusion::arrow::{
 };
 
 use datafusion::from_slice::FromSlice;
-use datafusion::physical_plan::functions::Volatility;
 use datafusion::{error::Result, logical_plan::create_udaf, physical_plan::Accumulator};
-use datafusion::{prelude::*, scalar::ScalarValue};
+use datafusion::{logical_expr::Volatility, prelude::*, scalar::ScalarValue};
 use std::sync::Arc;
 
 // create local session context with an in-memory table
@@ -46,7 +45,7 @@ fn create_context() -> Result<SessionContext> {
     )?;
 
     // declare a new context. In spark API, this corresponds to a new spark SQLsession
-    let mut ctx = SessionContext::new();
+    let ctx = SessionContext::new();
 
     // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
     let provider = MemTable::try_new(schema, vec![vec![batch1], vec![batch2]])?;

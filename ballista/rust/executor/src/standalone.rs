@@ -27,13 +27,14 @@ use ballista_core::{
     serde::protobuf::{scheduler_grpc_client::SchedulerGrpcClient, ExecutorRegistration},
     BALLISTA_VERSION,
 };
-use datafusion::prelude::SessionContext;
+use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use log::info;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tonic::transport::{Channel, Server};
 use uuid::Uuid;
 
+use crate::metrics::LoggingMetricsCollector;
 use crate::{execution_loop, executor::Executor, flight_service::BallistaFlightService};
 
 pub async fn new_standalone_executor<
@@ -71,8 +72,15 @@ pub async fn new_standalone_executor<
         .into_string()
         .unwrap();
     info!("work_dir: {}", work_dir);
-    let ctx = Arc::new(SessionContext::new());
-    let executor = Arc::new(Executor::new(executor_meta, &work_dir, ctx));
+
+    let config = RuntimeConfig::new().with_temp_file_path(work_dir.clone());
+
+    let executor = Arc::new(Executor::new(
+        executor_meta,
+        &work_dir,
+        Arc::new(RuntimeEnv::new(config).unwrap()),
+        Arc::new(LoggingMetricsCollector::default()),
+    ));
 
     let service = BallistaFlightService::new(executor.clone());
     let server = FlightServiceServer::new(service);

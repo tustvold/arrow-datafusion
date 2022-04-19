@@ -21,7 +21,7 @@ use datafusion::{
         datatypes::DataType,
         record_batch::RecordBatch,
     },
-    physical_plan::functions::Volatility,
+    logical_expr::Volatility,
 };
 
 use datafusion::from_slice::FromSlice;
@@ -49,7 +49,7 @@ fn create_context() -> Result<SessionContext> {
     )?;
 
     // declare a new context. In spark API, this corresponds to a new spark SQLsession
-    let mut ctx = SessionContext::new();
+    let ctx = SessionContext::new();
 
     // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
     let provider = MemTable::try_new(schema, vec![vec![batch]])?;

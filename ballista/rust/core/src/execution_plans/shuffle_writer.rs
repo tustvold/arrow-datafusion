@@ -342,10 +342,9 @@ impl ExecutionPlan for ShuffleWriterExec {
     }
 
     fn with_new_children(
-        &self,
+        self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        assert!(children.len() == 1);
         Ok(Arc::new(ShuffleWriterExec::try_new(
             self.job_id.clone(),
             self.stage_id,
@@ -452,6 +451,8 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    // number of rows in each partition is a function of the hash output, so don't test here
+    #[cfg(not(feature = "force_hash_collisions"))]
     async fn test() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
@@ -507,6 +508,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // number of rows in each partition is a function of the hash output, so don't test here
+    #[cfg(not(feature = "force_hash_collisions"))]
     async fn test_partitioned() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();

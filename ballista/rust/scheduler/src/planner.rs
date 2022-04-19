@@ -30,7 +30,9 @@ use ballista_core::{
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::windows::WindowAggExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{
+    with_new_children_if_necessary, ExecutionPlan, Partitioning,
+};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use log::info;
@@ -99,7 +101,7 @@ impl DistributedPlanner {
                 stages.append(&mut child_stages);
             }
 
-            if let Some(coalesce) = execution_plan
+            if let Some(_coalesce) = execution_plan
                 .as_any()
                 .downcast_ref::<CoalescePartitionsExec>()
             {
@@ -122,7 +124,10 @@ impl DistributedPlanner {
                 ));
                 stages.push(shuffle_writer);
                 Ok((
-                    coalesce.with_new_children(vec![unresolved_shuffle])?,
+                    with_new_children_if_necessary(
+                        execution_plan,
+                        vec![unresolved_shuffle],
+                    )?,
                     stages,
                 ))
             } else if let Some(repart) =
@@ -163,7 +168,10 @@ impl DistributedPlanner {
                     window
                 )))
             } else {
-                Ok((execution_plan.with_new_children(children)?, stages))
+                Ok((
+                    with_new_children_if_necessary(execution_plan, children)?,
+                    stages,
+                ))
             }
         }
         .boxed()
@@ -197,7 +205,7 @@ pub fn find_unresolved_shuffles(
 }
 
 pub fn remove_unresolved_shuffles(
-    stage: &dyn ExecutionPlan,
+    stage: Arc<dyn ExecutionPlan>,
     partition_locations: &HashMap<usize, HashMap<usize, Vec<PartitionLocation>>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
@@ -240,13 +248,10 @@ pub fn remove_unresolved_shuffles(
                 unresolved_shuffle.schema().clone(),
             )?))
         } else {
-            new_children.push(remove_unresolved_shuffles(
-                child.as_ref(),
-                partition_locations,
-            )?);
+            new_children.push(remove_unresolved_shuffles(child, partition_locations)?);
         }
     }
-    Ok(stage.with_new_children(new_children)?)
+    Ok(with_new_children_if_necessary(stage, new_children)?)
 }
 
 fn create_shuffle_writer(
@@ -280,6 +285,7 @@ mod test {
     };
     use datafusion::physical_plan::{displayable, ExecutionPlan};
     use datafusion::prelude::SessionContext;
+    use std::ops::Deref;
 
     use ballista_core::serde::protobuf::{LogicalPlanNode, PhysicalPlanNode};
     use std::sync::Arc;
@@ -293,7 +299,7 @@ mod test {
 
     #[tokio::test]
     async fn distributed_hash_aggregate_plan() -> Result<(), BallistaError> {
-        let mut ctx = datafusion_test_context("testdata").await?;
+        let ctx = datafusion_test_context("testdata").await?;
 
         // simplified form of TPC-H query 1
         let df = ctx
@@ -380,7 +386,7 @@ mod test {
 
     #[tokio::test]
     async fn distributed_join_plan() -> Result<(), BallistaError> {
-        let mut ctx = datafusion_test_context("testdata").await?;
+        let ctx = datafusion_test_context("testdata").await?;
 
         // simplified form of TPC-H query 12
         let df = ctx
@@ -555,7 +561,7 @@ order by
 
     #[tokio::test]
     async fn roundtrip_serde_hash_aggregate() -> Result<(), BallistaError> {
-        let mut ctx = datafusion_test_context("testdata").await?;
+        let ctx = datafusion_test_context("testdata").await?;
 
         // simplified form of TPC-H query 1
         let df = ctx
@@ -602,8 +608,12 @@ order by
                 plan.clone(),
                 codec.physical_extension_codec(),
             )?;
-        let result_exec_plan: Arc<dyn ExecutionPlan> =
-            (&proto).try_into_physical_plan(&ctx, codec.physical_extension_codec())?;
+        let runtime = ctx.runtime_env();
+        let result_exec_plan: Arc<dyn ExecutionPlan> = (&proto).try_into_physical_plan(
+            &ctx,
+            runtime.deref(),
+            codec.physical_extension_codec(),
+        )?;
         Ok(result_exec_plan)
     }
 }
