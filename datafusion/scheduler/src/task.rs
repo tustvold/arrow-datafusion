@@ -17,8 +17,11 @@
 
 use crate::query::Query;
 use crate::{is_worker, spawn_local, spawn_local_fifo, RoutablePipeline, Spawner};
+use arrow::datatypes::SchemaRef;
+use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::RecordBatchStream;
 use futures::channel::mpsc;
 use futures::task::ArcWake;
 use futures::{Stream, StreamExt};
@@ -33,6 +36,8 @@ pub fn spawn_query(query: Query, spawner: Spawner) -> QueryResults {
     debug!("Spawning query: {:#?}", query);
 
     let (sender, receiver) = mpsc::unbounded();
+    let schema = query.schema.clone();
+
     let query = Arc::new(QueryTask {
         spawner,
         pipelines: query.pipelines,
@@ -55,6 +60,7 @@ pub fn spawn_query(query: Query, spawner: Spawner) -> QueryResults {
 
     QueryResults {
         query,
+        schema,
         inner: receiver,
     }
 }
@@ -203,7 +209,10 @@ impl Task {
 ///
 /// Dropping this will cancel the inflight query
 pub struct QueryResults {
-    inner: mpsc::UnboundedReceiver<Option<Result<RecordBatch>>>,
+    inner: mpsc::UnboundedReceiver<Option<ArrowResult<RecordBatch>>>,
+
+    /// The output schema of thi
+    schema: SchemaRef,
 
     /// Keep a reference to the [`QueryTask`] so it isn't dropped early
     #[allow(unused)]
@@ -211,13 +220,19 @@ pub struct QueryResults {
 }
 
 impl Stream for QueryResults {
-    type Item = Result<RecordBatch>;
+    type Item = ArrowResult<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         self.inner.poll_next_unpin(cx).map(Option::flatten)
+    }
+}
+
+impl RecordBatchStream for QueryResults {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -232,7 +247,7 @@ struct QueryTask {
     pipelines: Vec<RoutablePipeline>,
 
     /// The output stream for this query's execution
-    output: mpsc::UnboundedSender<Option<Result<RecordBatch>>>,
+    output: mpsc::UnboundedSender<Option<ArrowResult<RecordBatch>>>,
 }
 
 impl Drop for QueryTask {
@@ -250,6 +265,7 @@ impl QueryTask {
 
     /// Sends `output` to this query's output stream
     fn send_query_output(&self, output: Result<RecordBatch>) {
+        let output = output.map_err(|e| e.into());
         let _ = self.output.unbounded_send(Some(output));
     }
 

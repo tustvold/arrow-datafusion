@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -55,6 +56,7 @@ pub struct RoutablePipeline {
 #[derive(Debug)]
 pub struct Query {
     pub pipelines: Vec<RoutablePipeline>,
+    pub schema: SchemaRef,
 }
 
 /// When converting [`ExecutionPlan`] to [`Pipeline`] we may wish to group
@@ -78,6 +80,9 @@ struct OperatorGroup {
 pub struct QueryBuilder {
     task_context: Arc<TaskContext>,
 
+    /// The output schema of this Query
+    schema: SchemaRef,
+
     /// The current list of completed pipelines
     in_progress: Vec<RoutablePipeline>,
 
@@ -93,9 +98,10 @@ pub struct QueryBuilder {
 impl QueryBuilder {
     pub fn new(plan: Arc<dyn ExecutionPlan>, task_context: Arc<TaskContext>) -> Self {
         Self {
+            task_context,
+            schema: plan.schema(),
             in_progress: vec![],
             to_visit: vec![(plan, None)],
-            task_context,
             execution_operators: None,
         }
     }
@@ -270,6 +276,7 @@ impl QueryBuilder {
         }
 
         Ok(Query {
+            schema: self.schema,
             pipelines: self.in_progress,
         })
     }
