@@ -238,8 +238,10 @@ impl Spawner {
 #[cfg(test)]
 mod tests {
     use arrow::util::pretty::pretty_format_batches;
+    use std::env;
     use std::ops::Range;
     use std::panic::panic_any;
+    use std::path::PathBuf;
 
     use futures::{StreamExt, TryStreamExt};
     use log::info;
@@ -249,9 +251,20 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, PrimitiveArray};
     use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float64Type, Int32Type};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datafusion_data_access::object_store::local::{
+        local_object_reader, local_object_reader_stream,
+    };
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::file_format::FileFormat;
+    use datafusion::datasource::listing::local_unpartitioned_file;
     use datafusion::datasource::{MemTable, TableProvider};
-    use datafusion::physical_plan::displayable;
-    use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion::physical_plan::file_format::FileScanConfig;
+    use datafusion::physical_plan::{collect, displayable};
+
+    use datafusion::prelude::{
+        col, lit, ParquetReadOptions, SessionConfig, SessionContext,
+    };
+    use datafusion_data_access::object_store::local::LocalFileSystem;
 
     use super::*;
 
@@ -374,6 +387,8 @@ mod tests {
                 expected, scheduled
             );
         }
+
+        assert!(false);
     }
 
     #[tokio::test]
@@ -407,5 +422,122 @@ mod tests {
         assert_eq!(buffer[0], "worker 0 panicked with: 1");
         assert_eq!(buffer[1], "worker 0 panicked with: UNKNOWN");
         assert_eq!(buffer[2], "worker 0 panicked with: test");
+    }
+
+    #[tokio::test]
+    async fn test_parquet() -> Result<()> {
+        let scheduler = Scheduler::new(4);
+
+        let session_ctx = SessionContext::new();
+        let task_ctx = session_ctx.task_ctx();
+
+        let testdata = parquet_test_data();
+        let path = format!("{}/{}", testdata, "alltypes_plain.parquet");
+
+        let exec = session_ctx
+            .read_parquet(path, ParquetReadOptions::default())
+            .await?
+            .filter(col("float_col").eq(lit(0.0)))?
+            .select(vec![col("float_col"), col("bool_col")])?
+            .create_physical_plan()
+            .await?;
+
+        let batches = collect(exec.clone(), task_ctx.clone()).await?;
+
+        let stream = scheduler.schedule(exec, task_ctx).unwrap();
+        let batches_scheduled: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        assert_eq!(1, batches.len());
+        assert_eq!(2, batches[0].num_columns());
+        assert_eq!(4, batches[0].num_rows());
+
+        assert_eq!(1, batches_scheduled.len());
+        assert_eq!(2, batches_scheduled[0].num_columns());
+        assert_eq!(4, batches_scheduled[0].num_rows());
+
+        Ok(())
+    }
+
+    fn get_data_dir(
+        udf_env: &str,
+        submodule_data: &str,
+    ) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+        // Try user defined env.
+        if let Ok(dir) = env::var(udf_env) {
+            let trimmed = dir.trim().to_string();
+            if !trimmed.is_empty() {
+                let pb = PathBuf::from(trimmed);
+                if pb.is_dir() {
+                    return Ok(pb);
+                } else {
+                    return Err(format!(
+                        "the data dir `{}` defined by env {} not found",
+                        pb.display(),
+                        udf_env
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // The env is undefined or its value is trimmed to empty, let's try default dir.
+
+        // env "CARGO_MANIFEST_DIR" is "the directory containing the manifest of your package",
+        // set by `cargo run` or `cargo test`, see:
+        // https://doc.rust-lang.org/cargo/reference/environment-variables.html
+        let dir = env!("CARGO_MANIFEST_DIR");
+
+        let pb = PathBuf::from(dir).join(submodule_data);
+        if pb.is_dir() {
+            Ok(pb)
+        } else {
+            Err(format!(
+                "env `{}` is undefined or has empty value, and the pre-defined data dir `{}` not found\n\
+             HINT: try running `git submodule update --init`",
+                udf_env,
+                pb.display(),
+            ).into())
+        }
+    }
+
+    pub fn parquet_test_data() -> String {
+        match get_data_dir("PARQUET_TEST_DATA", "../../parquet-testing/data") {
+            Ok(pb) => pb.display().to_string(),
+            Err(err) => panic!("failed to get parquet data dir: {}", err),
+        }
+    }
+
+    async fn get_exec(
+        file_name: &str,
+        projection: &Option<Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let testdata = parquet_test_data();
+        let filename = format!("{}/{}", testdata, file_name);
+        let format = ParquetFormat::default();
+        let file_schema = format
+            .infer_schema(local_object_reader_stream(vec![filename.clone()]))
+            .await
+            .expect("Schema inference");
+        let statistics = format
+            .infer_stats(local_object_reader(filename.clone()), file_schema.clone())
+            .await
+            .expect("Stats inference");
+        let file_groups = vec![vec![local_unpartitioned_file(filename.clone())]];
+        let exec = format
+            .create_physical_plan(
+                FileScanConfig {
+                    object_store: Arc::new(LocalFileSystem {}),
+                    file_schema,
+                    file_groups,
+                    statistics,
+                    projection: projection.clone(),
+                    limit,
+                    table_partition_cols: vec![],
+                },
+                &[],
+            )
+            .await?;
+        Ok(exec)
     }
 }

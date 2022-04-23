@@ -39,6 +39,7 @@ ahash = { version = "0.7", default-features = false }
 arrow = { version = "12" }
 async-trait = "0.1"
 datafusion = { path = "../core", version = "7.0.0" }
+datafusion-data-access = { path = "../../data-access", version = "1.0.0" }
 futures = "0.3"
 log = "0.4"
 parking_lot = "0.12"
