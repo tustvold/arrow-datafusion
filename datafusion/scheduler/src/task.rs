@@ -20,6 +20,7 @@ use crate::{is_worker, spawn_local, spawn_local_fifo, RoutablePipeline, Spawner}
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use futures::channel::mpsc;
+
 use futures::task::ArcWake;
 use futures::{Stream, StreamExt};
 use log::{debug, trace};
@@ -33,10 +34,18 @@ pub fn spawn_plan(plan: PipelinePlan, spawner: Spawner) -> ExecutionResults {
     debug!("Spawning pipeline plan: {:#?}", plan);
 
     let (sender, receiver) = mpsc::unbounded();
+
+    let active_partitions = plan
+        .pipelines
+        .first()
+        .map(|p| p.pipeline.output_partitions())
+        .unwrap_or(0);
+
     let context = Arc::new(ExecutionContext {
         spawner,
         pipelines: plan.pipelines,
         output: sender,
+        active_partitions: AtomicUsize::new(active_partitions),
     });
 
     for (pipeline_idx, query_pipeline) in context.pipelines.iter().enumerate() {
@@ -231,6 +240,9 @@ struct ExecutionContext {
 
     /// The output stream for this query's execution
     output: mpsc::UnboundedSender<Option<Result<RecordBatch>>>,
+
+    // Current number of active partitions
+    active_partitions: AtomicUsize,
 }
 
 impl Drop for ExecutionContext {
@@ -253,7 +265,12 @@ impl ExecutionContext {
 
     /// Mark this query as finished
     fn finish(&self) {
-        let _ = self.output.unbounded_send(None);
+        // If all output partitions are exhausted, close the output channel
+        if self.active_partitions.fetch_sub(1, Ordering::SeqCst) <= 1 {
+            let _ = self.output.unbounded_send(None);
+        } else {
+            trace!("closing active channel");
+        }
     }
 }
 

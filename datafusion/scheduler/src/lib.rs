@@ -431,7 +431,7 @@ mod tests {
         let exec = session_ctx
             .read_parquet(path, ParquetReadOptions::default())
             .await?
-            .filter(col("float_col").eq(lit(0.0)))?
+            .filter(col("float_col").eq(lit(0.0_f64)))?
             .select(vec![col("float_col"), col("bool_col")])?
             .create_physical_plan()
             .await?;
