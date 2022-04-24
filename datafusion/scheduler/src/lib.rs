@@ -251,20 +251,14 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, PrimitiveArray};
     use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float64Type, Int32Type};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::datafusion_data_access::object_store::local::{
-        local_object_reader, local_object_reader_stream,
-    };
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
-    use datafusion::datasource::file_format::FileFormat;
-    use datafusion::datasource::listing::local_unpartitioned_file;
+
     use datafusion::datasource::{MemTable, TableProvider};
-    use datafusion::physical_plan::file_format::FileScanConfig;
+
     use datafusion::physical_plan::{collect, displayable};
 
     use datafusion::prelude::{
         col, lit, ParquetReadOptions, SessionConfig, SessionContext,
     };
-    use datafusion_data_access::object_store::local::LocalFileSystem;
 
     use super::*;
 
@@ -387,8 +381,6 @@ mod tests {
                 expected, scheduled
             );
         }
-
-        assert!(false);
     }
 
     #[tokio::test]
@@ -426,6 +418,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet() -> Result<()> {
+        init_logging();
+
         let scheduler = Scheduler::new(4);
 
         let session_ctx = SessionContext::new();
@@ -505,39 +499,5 @@ mod tests {
             Ok(pb) => pb.display().to_string(),
             Err(err) => panic!("failed to get parquet data dir: {}", err),
         }
-    }
-
-    async fn get_exec(
-        file_name: &str,
-        projection: &Option<Vec<usize>>,
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let testdata = parquet_test_data();
-        let filename = format!("{}/{}", testdata, file_name);
-        let format = ParquetFormat::default();
-        let file_schema = format
-            .infer_schema(local_object_reader_stream(vec![filename.clone()]))
-            .await
-            .expect("Schema inference");
-        let statistics = format
-            .infer_stats(local_object_reader(filename.clone()), file_schema.clone())
-            .await
-            .expect("Stats inference");
-        let file_groups = vec![vec![local_unpartitioned_file(filename.clone())]];
-        let exec = format
-            .create_physical_plan(
-                FileScanConfig {
-                    object_store: Arc::new(LocalFileSystem {}),
-                    file_schema,
-                    file_groups,
-                    statistics,
-                    projection: projection.clone(),
-                    limit,
-                    table_partition_cols: vec![],
-                },
-                &[],
-            )
-            .await?;
-        Ok(exec)
     }
 }

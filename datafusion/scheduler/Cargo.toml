@@ -39,7 +39,6 @@ ahash = { version = "0.7", default-features = false }
 arrow = { version = "12" }
 async-trait = "0.1"
 datafusion = { path = "../core", version = "7.0.0" }
-datafusion-data-access = { path = "../../data-access", version = "1.0.0" }
 futures = "0.3"
 log = "0.4"
 parking_lot = "0.12"
@@ -52,6 +51,7 @@ parquet = "12.0"
 rand = "0.8"
 tempfile = "3"
 tokio = { version = "1.0", features = ["macros", "rt", "time"] }
+datafusion-data-access = { path = "../../data-access", version = "1.0.0" }
 
 [[bench]]
 harness = false

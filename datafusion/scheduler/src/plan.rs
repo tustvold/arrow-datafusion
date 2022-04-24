@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
@@ -237,6 +238,14 @@ impl PipelinePlanner {
             self.push_repartition(
                 coalesce.input().output_partitioning(),
                 Partitioning::RoundRobinBatch(1),
+                parent,
+                coalesce.children(),
+            )
+        } else if let Some(coalesce) = plan.as_any().downcast_ref::<CoalesceBatchesExec>()
+        {
+            self.push_repartition(
+                coalesce.input().output_partitioning(),
+                coalesce.output_partitioning(),
                 parent,
                 coalesce.children(),
             )
