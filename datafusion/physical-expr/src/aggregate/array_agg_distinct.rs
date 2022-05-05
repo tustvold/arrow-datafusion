@@ -121,8 +121,8 @@ impl DistinctArrayAggAccumulator {
 impl Accumulator for DistinctArrayAggAccumulator {
     fn state(&self) -> Result<Vec<ScalarValue>> {
         Ok(vec![ScalarValue::List(
-            Some(Box::new(self.values.clone().into_iter().collect())),
-            Box::new(self.datatype.clone()),
+            Some(self.values.clone().into_iter().collect()),
+            Box::new(Field::new("item", self.datatype.clone(), true)),
         )])
     }
 
@@ -152,8 +152,8 @@ impl Accumulator for DistinctArrayAggAccumulator {
 
     fn evaluate(&self) -> Result<ScalarValue> {
         Ok(ScalarValue::List(
-            Some(Box::new(self.values.clone().into_iter().collect())),
-            Box::new(self.datatype.clone()),
+            Some(self.values.iter().cloned().collect()),
+            Box::new(Field::new("item", self.datatype.clone(), true)),
         ))
     }
 }

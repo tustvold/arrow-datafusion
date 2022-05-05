@@ -2346,7 +2346,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         if data_types.is_empty() {
             Ok(Expr::Literal(ScalarValue::List(
                 None,
-                Box::new(DataType::Utf8),
+                Box::new(Field::new("item", DataType::Utf8, true)),
             )))
         } else if data_types.len() > 1 {
             Err(DataFusionError::NotImplemented(format!(
@@ -2357,8 +2357,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             let data_type = values[0].get_datatype();
 
             Ok(Expr::Literal(ScalarValue::List(
-                Some(Box::new(values)),
-                Box::new(data_type),
+                Some(values),
+                Box::new(Field::new("item", data_type, true)),
             )))
         }
     }

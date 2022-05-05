@@ -43,7 +43,7 @@ use crate::{
     error::{DataFusionError, Result},
     scalar::ScalarValue,
 };
-use arrow::array::{new_null_array, UInt16BufferBuilder};
+use arrow::array::{Array, new_null_array, UInt16BufferBuilder};
 use arrow::record_batch::RecordBatchOptions;
 use datafusion_data_access::object_store::ObjectStore;
 use lazy_static::lazy_static;
@@ -268,6 +268,8 @@ impl SchemaAdapter {
             if let Some((batch_idx, _name)) =
                 batch_schema.column_with_name(table_field.name().as_str())
             {
+                let data_type = batch_cols[batch_idx].data_type();
+                println!("{:#?}", data_type);
                 cols.push(batch_cols[batch_idx].clone());
             } else {
                 cols.push(new_null_array(table_field.data_type(), batch_rows))

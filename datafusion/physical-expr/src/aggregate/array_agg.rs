@@ -133,7 +133,7 @@ impl Accumulator for ArrayAggAccumulator {
         (0..arr.len()).try_for_each(|index| {
             let scalar = ScalarValue::try_from_array(arr, index)?;
             if let ScalarValue::List(Some(values), _) = scalar {
-                self.values.extend(*values);
+                self.values.extend(values);
                 Ok(())
             } else {
                 Err(DataFusionError::Internal(
@@ -149,8 +149,8 @@ impl Accumulator for ArrayAggAccumulator {
 
     fn evaluate(&self) -> Result<ScalarValue> {
         Ok(ScalarValue::List(
-            Some(Box::new(self.values.clone())),
-            Box::new(self.datatype.clone()),
+            Some(self.values.clone()),
+            Box::new(Field::new("item", self.datatype.clone(), true)),
         ))
     }
 }
@@ -172,14 +172,14 @@ mod tests {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
 
         let list = ScalarValue::List(
-            Some(Box::new(vec![
+            Some(vec![
                 ScalarValue::Int32(Some(1)),
                 ScalarValue::Int32(Some(2)),
                 ScalarValue::Int32(Some(3)),
                 ScalarValue::Int32(Some(4)),
                 ScalarValue::Int32(Some(5)),
-            ])),
-            Box::new(DataType::Int32),
+            ]),
+            Box::new(Field::new("item", DataType::Int32, true)),
         );
 
         generic_test_op!(a, DataType::Int32, ArrayAgg, list, DataType::Int32)
@@ -187,71 +187,51 @@ mod tests {
 
     #[test]
     fn array_agg_nested() -> Result<()> {
+        let leaf_t = Box::new(Field::new("item", DataType::Int32, true));
+        let list_t = Box::new(Field::new("item", DataType::List(leaf_t.clone()), true));
+        let list_list_t =
+            Box::new(Field::new("item", DataType::List(list_t.clone()), true));
+
         let l1 = ScalarValue::List(
-            Some(Box::new(vec![
+            Some(vec![
                 ScalarValue::List(
-                    Some(Box::new(vec![
+                    Some(vec![
                         ScalarValue::from(1i32),
                         ScalarValue::from(2i32),
                         ScalarValue::from(3i32),
-                    ])),
-                    Box::new(DataType::Int32),
+                    ]),
+                    leaf_t.clone(),
                 ),
                 ScalarValue::List(
-                    Some(Box::new(vec![
-                        ScalarValue::from(4i32),
-                        ScalarValue::from(5i32),
-                    ])),
-                    Box::new(DataType::Int32),
+                    Some(vec![ScalarValue::from(4i32), ScalarValue::from(5i32)]),
+                    leaf_t.clone(),
                 ),
-            ])),
-            Box::new(DataType::List(Box::new(Field::new(
-                "item",
-                DataType::Int32,
-                true,
-            )))),
+            ]),
+            list_t.clone(),
         );
 
         let l2 = ScalarValue::List(
-            Some(Box::new(vec![
+            Some(vec![
+                ScalarValue::List(Some(vec![ScalarValue::from(6i32)]), leaf_t.clone()),
                 ScalarValue::List(
-                    Some(Box::new(vec![ScalarValue::from(6i32)])),
-                    Box::new(DataType::Int32),
+                    Some(vec![ScalarValue::from(7i32), ScalarValue::from(8i32)]),
+                    leaf_t.clone(),
                 ),
-                ScalarValue::List(
-                    Some(Box::new(vec![
-                        ScalarValue::from(7i32),
-                        ScalarValue::from(8i32),
-                    ])),
-                    Box::new(DataType::Int32),
-                ),
-            ])),
-            Box::new(DataType::List(Box::new(Field::new(
-                "item",
-                DataType::Int32,
-                true,
-            )))),
+            ]),
+            list_t.clone(),
         );
 
         let l3 = ScalarValue::List(
-            Some(Box::new(vec![ScalarValue::List(
-                Some(Box::new(vec![ScalarValue::from(9i32)])),
-                Box::new(DataType::Int32),
-            )])),
-            Box::new(DataType::List(Box::new(Field::new(
-                "item",
-                DataType::Int32,
-                true,
-            )))),
+            Some(vec![ScalarValue::List(
+                Some(vec![ScalarValue::from(9i32)]),
+                leaf_t.clone(),
+            )]),
+            list_t.clone(),
         );
 
         let list = ScalarValue::List(
-            Some(Box::new(vec![l1.clone(), l2.clone(), l3.clone()])),
-            Box::new(DataType::List(Box::new(Field::new(
-                "item",
-                DataType::Int32,
-                true,
-            )))),
+            Some(vec![l1.clone(), l2.clone(), l3.clone()]),
+            list_list_t,
         );
 
         let array = ScalarValue::iter_to_array(vec![l1, l2, l3]).unwrap();
