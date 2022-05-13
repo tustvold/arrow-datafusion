@@ -26,9 +26,10 @@ use crate::{
     },
 };
 
+use crate::datasource::listing::ListingTableUrl;
 use crate::datasource::object_store_registry::ObjectStoreRegistry;
 use datafusion_common::DataFusionError;
-use datafusion_data_access::object_store::ObjectStore;
+use object_store::ObjectStore;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,10 +101,7 @@ impl RuntimeEnv {
     }
 
     /// Retrieves a `ObjectStore` instance by scheme
-    pub fn object_store<'a>(
-        &self,
-        uri: &'a str,
-    ) -> Result<(Arc<dyn ObjectStore>, &'a str)> {
+    pub fn object_store(&self, uri: &ListingTableUrl) -> Result<Arc<dyn ObjectStore>> {
         self.object_store_registry
             .get_by_uri(uri)
             .map_err(DataFusionError::from)

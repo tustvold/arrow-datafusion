@@ -220,7 +220,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
 
         let num_partitions = 4;
-        let csv = test::scan_partitioned_csv(num_partitions)?;
+        let csv = test::scan_partitioned_csv(num_partitions).await?;
 
         // input should have 4 partitions
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);

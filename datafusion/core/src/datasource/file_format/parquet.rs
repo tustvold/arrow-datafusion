@@ -18,20 +18,15 @@
 //! Parquet format abstractions
 
 use std::any::Any;
-use std::io::Read;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use hashbrown::HashMap;
+use object_store::{ObjectMeta, ObjectStore};
 use parquet::arrow::ArrowReader;
 use parquet::arrow::ParquetFileArrowReader;
-use parquet::errors::ParquetError;
-use parquet::errors::Result as ParquetResult;
-use parquet::file::reader::ChunkReader;
-use parquet::file::reader::Length;
 use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 
@@ -41,16 +36,14 @@ use crate::arrow::array::{
     BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
 };
 use crate::arrow::datatypes::{DataType, Field};
+use crate::datasource::local::fetch_to_local_file;
 use crate::datasource::{create_max_min_accs, get_col_stats};
-use crate::error::DataFusionError;
 use crate::error::Result;
 use crate::logical_plan::combine_filters;
 use crate::logical_plan::Expr;
 use crate::physical_plan::expressions::{MaxAccumulator, MinAccumulator};
 use crate::physical_plan::file_format::{ParquetExec, SchemaAdapter};
-use crate::physical_plan::{metrics, ExecutionPlan};
-use crate::physical_plan::{Accumulator, Statistics};
-use datafusion_data_access::object_store::{ObjectReader, ObjectReaderStream};
+use crate::physical_plan::{Accumulator, ExecutionPlan, Statistics};
 
 /// The default file exetension of parquet files
 pub const DEFAULT_PARQUET_EXTENSION: &str = ".parquet";
@@ -88,24 +81,27 @@ impl FileFormat for ParquetFormat {
         self
     }
 
-    async fn infer_schema(&self, readers: ObjectReaderStream) -> Result<SchemaRef> {
-        let merged_schema = readers
-            .map_err(DataFusionError::IoError)
-            .try_fold(Schema::empty(), |acc, reader| async {
-                let next_schema = fetch_schema(reader);
-                Schema::try_merge([acc, next_schema?])
-                    .map_err(DataFusionError::ArrowError)
-            })
-            .await?;
-        Ok(Arc::new(merged_schema))
+    async fn infer_schema(
+        &self,
+        store: &dyn ObjectStore,
+        files: &[ObjectMeta],
+    ) -> Result<SchemaRef> {
+        let mut schemas = Vec::with_capacity(files.len());
+        for file in files {
+            let schema = fetch_schema(store, file).await?;
+            schemas.push(schema)
+        }
+        let schema = Schema::try_merge(schemas)?;
+        Ok(Arc::new(schema))
     }
 
     async fn infer_stats(
         &self,
-        reader: Arc<dyn ObjectReader>,
+        store: &dyn ObjectStore,
         table_schema: SchemaRef,
+        file: &ObjectMeta,
     ) -> Result<Statistics> {
-        let stats = fetch_statistics(reader, table_schema)?;
+        let stats = fetch_statistics(store, table_schema, file).await?;
         Ok(stats)
     }
 
@@ -274,12 +270,10 @@ fn summarize_min_max(
 }
 
 /// Read and parse the schema of the Parquet file at location `path`
-fn fetch_schema(object_reader: Arc<dyn ObjectReader>) -> Result<Schema> {
-    let obj_reader = ChunkObjectReader {
-        object_reader,
-        bytes_scanned: None,
-    };
-    let file_reader = Arc::new(SerializedFileReader::new(obj_reader)?);
+async fn fetch_schema(store: &dyn ObjectStore, file: &ObjectMeta) -> Result<Schema> {
+    // TODO: Fetching entire file is wasteful
+    let file = fetch_to_local_file(store, &file.location).await?;
+    let file_reader = Arc::new(SerializedFileReader::new(file)?);
     let mut arrow_reader = ParquetFileArrowReader::new(file_reader);
     let schema = arrow_reader.get_schema()?;
 
@@ -287,15 +281,14 @@ fn fetch_schema(object_reader: Arc<dyn ObjectReader>) -> Result<Schema> {
 }
 
 /// Read and parse the statistics of the Parquet file at location `path`
-fn fetch_statistics(
-    object_reader: Arc<dyn ObjectReader>,
+async fn fetch_statistics(
+    store: &dyn ObjectStore,
     table_schema: SchemaRef,
+    file: &ObjectMeta,
 ) -> Result<Statistics> {
-    let obj_reader = ChunkObjectReader {
-        object_reader,
-        bytes_scanned: None,
-    };
-    let file_reader = Arc::new(SerializedFileReader::new(obj_reader)?);
+    // TODO: Fetching entire file is wasteful
+    let file = fetch_to_local_file(store, &file.location).await?;
+    let file_reader = Arc::new(SerializedFileReader::new(file)?);
     let mut arrow_reader = ParquetFileArrowReader::new(file_reader);
     let file_schema = arrow_reader.get_schema()?;
     let num_fields = table_schema.fields().len();
@@ -367,44 +360,56 @@ fn fetch_statistics(
     Ok(statistics)
 }
 
-/// A wrapper around the object reader to make it implement `ChunkReader`
-pub struct ChunkObjectReader {
-    /// The underlying object reader
-    pub object_reader: Arc<dyn ObjectReader>,
-    /// Optional counter which will track total number of bytes scanned
-    pub bytes_scanned: Option<metrics::Count>,
-}
+#[cfg(test)]
+pub(crate) mod test_util {
+    use super::*;
+    use arrow::record_batch::RecordBatch;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::{InMemoryWriteableCursor, TryClone};
 
-impl Length for ChunkObjectReader {
-    fn len(&self) -> u64 {
-        self.object_reader.length()
-    }
-}
+    pub async fn store_parquet(
+        batches: Vec<RecordBatch>,
+    ) -> Result<(Vec<ObjectMeta>, Arc<dyn ObjectStore>)> {
+        let mut files = Vec::with_capacity(batches.len());
+        let store = InMemory::new();
+        for (idx, batch) in batches.iter().enumerate() {
+            let output = InMemoryWriteableCursor::default();
 
-impl ChunkReader for ChunkObjectReader {
-    type T = Box<dyn Read + Send + Sync>;
+            let props = WriterProperties::builder().build();
+            let mut writer = ArrowWriter::try_new(
+                output.try_clone().unwrap(),
+                batch.schema(),
+                Some(props),
+            )
+            .expect("creating writer");
 
-    fn get_read(&self, start: u64, length: usize) -> ParquetResult<Self::T> {
-        if let Some(m) = self.bytes_scanned.as_ref() {
-            m.add(length)
+            writer.write(batch).expect("Writing batch");
+            writer.close().unwrap();
+
+            drop(writer);
+
+            let path = Path::from_raw(format!("{}.parquet", idx));
+
+            let bytes = output.into_inner().unwrap();
+            store.put(&path, bytes.into()).await.unwrap();
+            files.push(store.head(&path).await.unwrap());
         }
-        self.object_reader
-            .sync_chunk_reader(start, length)
-            .map_err(DataFusionError::IoError)
-            .map_err(|e| ParquetError::ArrowError(e.to_string()))
+
+        Ok((files, Arc::new(store)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::datasource::listing::local_unpartitioned_file;
     use crate::physical_plan::collect;
-    use datafusion_data_access::object_store::local::{
-        local_object_reader, local_object_reader_stream, LocalFileSystem,
-    };
 
     use super::*;
 
+    use crate::datasource::file_format::parquet::test_util::store_parquet;
+    use crate::datasource::file_format::test_util::get_exec_format;
     use crate::physical_plan::metrics::MetricValue;
     use crate::prelude::{SessionConfig, SessionContext};
     use arrow::array::{
@@ -414,9 +419,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion_common::ScalarValue;
     use futures::StreamExt;
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-    use tempfile::NamedTempFile;
 
     // Add a new column with the specified field name to the RecordBatch
     fn add_to_batch(
@@ -440,33 +442,6 @@ mod tests {
         )
     }
 
-    async fn create_table(
-        batches: Vec<RecordBatch>,
-    ) -> Result<(Vec<NamedTempFile>, Schema)> {
-        let merged_schema =
-            Schema::try_merge(batches.iter().map(|b| b.schema().as_ref().clone()))?;
-
-        let files: Vec<_> = batches
-            .into_iter()
-            .map(|batch| {
-                let output = tempfile::NamedTempFile::new().expect("creating temp file");
-
-                let props = WriterProperties::builder().build();
-                let file: std::fs::File = (*output.as_file())
-                    .try_clone()
-                    .expect("cloning file descriptor");
-                let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
-                    .expect("creating writer");
-
-                writer.write(&batch).expect("Writing batch");
-                writer.close().unwrap();
-                output
-            })
-            .collect();
-
-        Ok((files, merged_schema))
-    }
-
     #[tokio::test]
     async fn read_merged_batches() -> Result<()> {
         let c1: ArrayRef =
@@ -478,12 +453,12 @@ mod tests {
 
         let batch2 = create_batch(vec![("c2", c2)]);
 
-        let (files, schema) = create_table(vec![batch1, batch2]).await?;
-        let table_schema = Arc::new(schema);
+        let (files, store) = store_parquet(vec![batch1, batch2]).await?;
 
-        let reader = local_object_reader(files[0].path().to_string_lossy().to_string());
+        let format = ParquetFormat::default();
+        let schema = format.infer_schema(store.as_ref(), &files).await.unwrap();
 
-        let stats = fetch_statistics(reader, table_schema.clone())?;
+        let stats = fetch_statistics(store.as_ref(), schema.clone(), &files[0]).await?;
 
         assert_eq!(stats.num_rows, Some(3));
         let c1_stats = &stats.column_statistics.as_ref().expect("missing c1 stats")[0];
@@ -491,9 +466,7 @@ mod tests {
         assert_eq!(c1_stats.null_count, Some(1));
         assert_eq!(c2_stats.null_count, Some(3));
 
-        let reader = local_object_reader(files[1].path().to_string_lossy().to_string());
-
-        let stats = fetch_statistics(reader, table_schema)?;
+        let stats = fetch_statistics(store.as_ref(), schema, &files[1]).await?;
         assert_eq!(stats.num_rows, Some(3));
         let c1_stats = &stats.column_statistics.as_ref().expect("missing c1 stats")[0];
         let c2_stats = &stats.column_statistics.as_ref().expect("missing c2 stats")[1];
@@ -510,7 +483,7 @@ mod tests {
         let config = SessionConfig::new().with_batch_size(2);
         let ctx = SessionContext::with_config(config);
         let projection = None;
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
         let task_ctx = ctx.task_ctx();
         let stream = exec.execute(0, task_ctx)?;
 
@@ -539,19 +512,18 @@ mod tests {
         let projection = None;
 
         // Read the full file
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         // Read only one column. This should scan less data.
-        let exec_projected =
-            get_exec("alltypes_plain.parquet", &Some(vec![0]), None).await?;
+        let exec_projected = get_exec("alltypes_plain.parquet", Some(&[0]), None).await?;
 
         let task_ctx = ctx.task_ctx();
 
         let _ = collect(exec.clone(), task_ctx.clone()).await?;
         let _ = collect(exec_projected.clone(), task_ctx).await?;
 
-        assert_bytes_scanned(exec, 2522);
-        assert_bytes_scanned(exec_projected, 1924);
+        assert_bytes_scanned(exec, 1851);
+        assert_bytes_scanned(exec_projected, 1851);
 
         Ok(())
     }
@@ -561,16 +533,15 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let projection = None;
-        let exec = get_exec("alltypes_plain.parquet", &projection, Some(1)).await?;
+        let exec = get_exec("alltypes_plain.parquet", projection, Some(1)).await?;
 
-        // note: even if the limit is set, the executor rounds up to the batch size
         assert_eq!(exec.statistics().num_rows, Some(8));
         assert_eq!(exec.statistics().total_byte_size, Some(671));
         assert!(exec.statistics().is_exact);
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
         assert_eq!(11, batches[0].num_columns());
-        assert_eq!(8, batches[0].num_rows());
+        assert_eq!(1, batches[0].num_rows());
 
         Ok(())
     }
@@ -580,7 +551,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let projection = None;
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         let x: Vec<String> = exec
             .schema()
@@ -617,8 +588,8 @@ mod tests {
     async fn read_bool_alltypes_plain_parquet() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let projection = Some(vec![1]);
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let projection: Option<&[usize]> = Some(&[1]);
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
@@ -647,8 +618,8 @@ mod tests {
     async fn read_i32_alltypes_plain_parquet() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let projection = Some(vec![0]);
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let projection: Option<&[usize]> = Some(&[0]);
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
@@ -674,8 +645,8 @@ mod tests {
     async fn read_i96_alltypes_plain_parquet() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let projection = Some(vec![10]);
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let projection: Option<&[usize]> = Some(&[10]);
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
@@ -701,8 +672,8 @@ mod tests {
     async fn read_f32_alltypes_plain_parquet() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let projection = Some(vec![6]);
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let projection: Option<&[usize]> = Some(&[6]);
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
@@ -731,8 +702,8 @@ mod tests {
     async fn read_f64_alltypes_plain_parquet() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let projection = Some(vec![7]);
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let projection: Option<&[usize]> = Some(&[7]);
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
@@ -761,8 +732,8 @@ mod tests {
     async fn read_binary_alltypes_plain_parquet() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let projection = Some(vec![9]);
-        let exec = get_exec("alltypes_plain.parquet", &projection, None).await?;
+        let projection: Option<&[usize]> = Some(&[9]);
+        let exec = get_exec("alltypes_plain.parquet", projection, None).await?;
 
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
@@ -800,35 +771,11 @@ mod tests {
 
     async fn get_exec(
         file_name: &str,
-        projection: &Option<Vec<usize>>,
+        projection: Option<&[usize]>,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let testdata = crate::test_util::parquet_test_data();
-        let filename = format!("{}/{}", testdata, file_name);
         let format = ParquetFormat::default();
-        let file_schema = format
-            .infer_schema(local_object_reader_stream(vec![filename.clone()]))
-            .await
-            .expect("Schema inference");
-        let statistics = format
-            .infer_stats(local_object_reader(filename.clone()), file_schema.clone())
-            .await
-            .expect("Stats inference");
-        let file_groups = vec![vec![local_unpartitioned_file(filename.clone())]];
-        let exec = format
-            .create_physical_plan(
-                FileScanConfig {
-                    object_store: Arc::new(LocalFileSystem {}),
-                    file_schema,
-                    file_groups,
-                    statistics,
-                    projection: projection.clone(),
-                    limit,
-                    table_partition_cols: vec![],
-                },
-                &[],
-            )
-            .await?;
-        Ok(exec)
+        get_exec_format(&format, &testdata, file_name, projection, limit).await
     }
 }

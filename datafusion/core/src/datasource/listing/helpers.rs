@@ -17,7 +17,7 @@
 
 //! Helper functions for the table implementation
 
-use std::path::{Component, Path};
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use arrow::{
@@ -29,13 +29,19 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chrono::{TimeZone, Utc};
-use datafusion_common::DataFusionError;
+use futures::stream::BoxStream;
 use futures::{
     stream::{self},
-    StreamExt, TryStreamExt,
+    TryStreamExt,
 };
 use log::debug;
+use object_store::{path::Path, ObjectMeta, ObjectStore};
+use url::Url;
 
+use datafusion_common::DataFusionError;
+use datafusion_expr::Volatility;
+
+use crate::datasource::listing::PartitionedFile;
 use crate::{
     datasource::MemTable,
     error::Result,
@@ -43,10 +49,6 @@ use crate::{
     logical_plan::{self, Expr, ExprVisitable, ExpressionVisitor, Recursion},
     scalar::ScalarValue,
 };
-
-use super::{PartitionedFile, PartitionedFileStream};
-use datafusion_data_access::{object_store::ObjectStore, FileMeta, SizedFile};
-use datafusion_expr::Volatility;
 
 const FILE_SIZE_COLUMN_NAME: &str = "_df_part_file_size_";
 const FILE_PATH_COLUMN_NAME: &str = "_df_part_file_path_";
@@ -153,6 +155,98 @@ pub fn split_files(
         .collect()
 }
 
+#[derive(Debug, Clone)]
+pub struct ListingTableUrl {
+    url: Url,
+    location: Path,
+    is_file: bool,
+}
+
+impl ListingTableUrl {
+    pub fn parse(s: impl AsRef<str>) -> Result<Self> {
+        let s = s.as_ref();
+        let url = match Url::parse(s) {
+            Ok(url) => url,
+            Err(url::ParseError::RelativeUrlWithoutBase) => {
+                let path = std::path::Path::new(s).canonicalize()?;
+                match path.is_file() {
+                    true => Url::from_file_path(path).unwrap(),
+                    false => Url::from_directory_path(path).unwrap(),
+                }
+            }
+            Err(e) => return Err(DataFusionError::External(Box::new(e))),
+        };
+
+        // A directory if ends in a `/` or lacks a file suffix
+        let last_segment = url.path_segments().unwrap().last().unwrap();
+        let is_file = !last_segment.is_empty()
+            && last_segment.split('.').filter(|x| !x.is_empty()).count() > 1;
+
+        let location = Path::from_raw(url.path());
+
+        Ok(Self {
+            url,
+            location,
+            is_file,
+        })
+    }
+
+    pub fn scheme(&self) -> &str {
+        self.url.scheme()
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    pub fn table_name(&self) -> Result<&str> {
+        self.url
+            .path_segments()
+            .expect("base path")
+            .rev()
+            .filter(|x| !x.is_empty())
+            .next()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "No path from which to determine table name"
+                ))
+            })
+    }
+}
+
+impl std::fmt::Display for ListingTableUrl {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.url)
+    }
+}
+
+/// List all files for the provided `table_path` and `file_extension`
+pub fn list_all_files<'a>(
+    store: &'a dyn ObjectStore,
+    path: &'a ListingTableUrl,
+    file_extension: &'a str,
+) -> BoxStream<'a, Result<ObjectMeta>> {
+    // If ends with file prefix, perform head request
+    if path.is_file() {
+        return Box::pin(
+            futures::stream::once(store.head(&path.location))
+                .map_err(|e| DataFusionError::External(Box::new(e))),
+        );
+    }
+
+    // TODO: Glob support
+    Box::pin(
+        futures::stream::once(async move { store.list(Some(&path.location)).await })
+            .try_flatten()
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+            .try_filter(move |object_meta| {
+                futures::future::ready(
+                    object_meta.location.to_raw().ends_with(file_extension),
+                )
+            }),
+    )
+}
+
 /// Discover the partitions on the given path and prune out files
 /// that belong to irrelevant partitions using `filters` expressions.
 /// `filters` might contain expressions that can be resolved only at the
@@ -161,94 +255,59 @@ pub fn split_files(
 /// TODO for tables with many files (10k+), it will usually more efficient
 /// to first list the folders relative to the first partition dimension,
 /// prune those, then list only the contain of the remaining folders.
-pub async fn pruned_partition_list(
-    store: &dyn ObjectStore,
-    table_path: &str,
+pub async fn pruned_partition_list<'a>(
+    store: &'a dyn ObjectStore,
+    table_path: &'a ListingTableUrl,
     filters: &[Expr],
-    file_extension: &str,
-    table_partition_cols: &[String],
-) -> Result<PartitionedFileStream> {
+    file_extension: &'a str,
+    table_partition_cols: &'a [String],
+) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
+    let list = list_all_files(store, table_path, file_extension);
+
     // if no partition col => simply list all the files
     if table_partition_cols.is_empty() {
-        return Ok(Box::pin(
-            store
-                .glob_file_with_suffix(table_path, file_extension)
-                .await?
-                .map(|f| {
-                    Ok(PartitionedFile {
-                        partition_values: vec![],
-                        file_meta: f?,
-                        range: None,
-                    })
-                }),
-        ));
+        return Ok(Box::pin(list.map_ok(|object_meta| object_meta.into())));
     }
 
     let applicable_filters: Vec<_> = filters
         .iter()
         .filter(|f| expr_applicable_for_cols(table_partition_cols, f))
         .collect();
-    let stream_path = table_path.to_owned();
+
     if applicable_filters.is_empty() {
         // Parse the partition values while listing all the files
         // Note: We might avoid parsing the partition values if they are not used in any projection,
         // but the cost of parsing will likely be far dominated by the time to fetch the listing from
         // the object store.
-        let table_partition_cols_stream = table_partition_cols.to_vec();
-        Ok(Box::pin(
-            store
-                .glob_file_with_suffix(table_path, file_extension)
-                .await?
-                .filter_map(move |f| {
-                    let stream_path = stream_path.clone();
-                    let table_partition_cols_stream = table_partition_cols_stream.clone();
-                    async move {
-                        let file_meta = match f {
-                            Ok(fm) => fm,
-                            Err(err) => return Some(Err(err)),
-                        };
-                        let parsed_path = parse_partitions_for_path(
-                            &stream_path,
-                            file_meta.path(),
-                            &table_partition_cols_stream,
-                        )
-                        .map(|p| {
-                            p.iter()
-                                .map(|&pn| ScalarValue::Utf8(Some(pn.to_owned())))
-                                .collect()
-                        });
+        Ok(Box::pin(list.try_filter_map(
+            move |object_meta| async move {
+                let parsed_path = parse_partitions_for_path(
+                    table_path,
+                    &object_meta.location,
+                    table_partition_cols,
+                )
+                .map(|p| {
+                    p.iter()
+                        .map(|&pn| ScalarValue::Utf8(Some(pn.to_owned())))
+                        .collect()
+                });
 
-                        parsed_path.map(|partition_values| {
-                            Ok(PartitionedFile {
-                                partition_values,
-                                file_meta,
-                                range: None,
-                            })
-                        })
-                    }
-                }),
-        ))
+                Ok(parsed_path.map(|partition_values| PartitionedFile {
+                    partition_values,
+                    object_meta,
+                    range: None,
+                }))
+            },
+        )))
     } else {
         // parse the partition values and serde them as a RecordBatch to filter them
-        // TODO avoid collecting but have a streaming memory table instead
-        let batches: Vec<RecordBatch> = store
-            .glob_file_with_suffix(table_path, file_extension)
-            .await?
-            // TODO we set an arbitrary high batch size here, it does not matter as we list
-            // all the files anyway. This number will need to be adjusted according to the object
-            // store if we switch to a streaming-stlye pruning of the files. For instance S3 lists
-            // 1000 items at a time so batches of 1000 would be ideal with S3 as store.
-            .chunks(1024)
-            .map(|v| {
-                v.into_iter()
-                    .collect::<datafusion_data_access::Result<Vec<_>>>()
-            })
-            .map_err(DataFusionError::IoError)
-            .map(move |metas| paths_to_batch(table_partition_cols, &stream_path, &metas?))
+        let metas: Vec<_> = list
             .try_collect()
-            .await?;
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let mem_table = MemTable::try_new(batches[0].schema(), vec![batches])?;
+        let batch = paths_to_batch(table_partition_cols, table_path, &metas)?;
+        let mem_table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
 
         // Filter the partitions using a local datafusion context
         // TODO having the external context would allow us to resolve `Volatility::Stable`
@@ -275,8 +334,8 @@ pub async fn pruned_partition_list(
 /// Note: For the last modified date, this looses precisions higher than millisecond.
 fn paths_to_batch(
     table_partition_cols: &[String],
-    table_path: &str,
-    metas: &[FileMeta],
+    table_path: &ListingTableUrl,
+    metas: &[ObjectMeta],
 ) -> Result<RecordBatch> {
     let mut key_builder = StringBuilder::new(metas.len());
     let mut length_builder = UInt64Builder::new(metas.len());
@@ -285,21 +344,18 @@ fn paths_to_batch(
         .iter()
         .map(|_| StringBuilder::new(metas.len()))
         .collect::<Vec<_>>();
-    for file_meta in metas {
+    for meta in metas {
         if let Some(partition_values) =
-            parse_partitions_for_path(table_path, file_meta.path(), table_partition_cols)
+            parse_partitions_for_path(table_path, &meta.location, table_partition_cols)
         {
-            key_builder.append_value(file_meta.path())?;
-            length_builder.append_value(file_meta.size())?;
-            match file_meta.last_modified {
-                Some(lm) => modified_builder.append_value(lm.timestamp_millis())?,
-                None => modified_builder.append_null()?,
-            }
+            key_builder.append_value(meta.location.to_raw())?;
+            length_builder.append_value(meta.size as u64)?;
+            modified_builder.append_value(meta.last_modified.timestamp_millis())?;
             for (i, part_val) in partition_values.iter().enumerate() {
                 partition_builders[i].append_value(part_val)?;
             }
         } else {
-            debug!("No partitioning for path {}", file_meta.path());
+            debug!("No partitioning for path {}", meta.location);
         }
     }
 
@@ -349,15 +405,13 @@ fn batches_to_paths(batches: &[RecordBatch]) -> Vec<PartitionedFile> {
                 .unwrap();
 
             (0..batch.num_rows()).map(move |row| PartitionedFile {
-                file_meta: FileMeta {
+                object_meta: ObjectMeta {
+                    location: Path::from_raw(key_array.value(row)),
                     last_modified: match modified_array.is_null(row) {
-                        false => Some(Utc.timestamp_millis(modified_array.value(row))),
-                        true => None,
+                        false => Utc.timestamp_millis(modified_array.value(row)),
+                        true => Utc.timestamp_nanos(0),
                     },
-                    sized_file: SizedFile {
-                        path: key_array.value(row).to_owned(),
-                        size: length_array.value(row),
-                    },
+                    size: length_array.value(row) as usize,
                 },
                 partition_values: (3..batch.columns().len())
                     .map(|col| {
@@ -373,21 +427,28 @@ fn batches_to_paths(batches: &[RecordBatch]) -> Vec<PartitionedFile> {
 /// Extract the partition values for the given `file_path` (in the given `table_path`)
 /// associated to the partitions defined by `table_partition_cols`
 fn parse_partitions_for_path<'a>(
-    table_path: &str,
-    file_path: &'a str,
+    table_path: &ListingTableUrl,
+    file_path: &'a Path,
     table_partition_cols: &[String],
 ) -> Option<Vec<&'a str>> {
-    let subpath = file_path.strip_prefix(table_path)?;
+    use object_store::path::DELIMITER;
 
-    // split subpath into components ignoring leading separator if exists
-    let subpath = Path::new(subpath)
-        .components()
-        .filter(|c| !matches!(c, Component::RootDir))
-        .filter_map(|c| c.as_os_str().to_str());
+    // TODO: Use prefix match
+    let diff = itertools::diff_with(
+        file_path.to_raw().split(DELIMITER),
+        table_path.location.to_raw().split(DELIMITER),
+        |a, b| a == b,
+    );
+
+    let subpath = match diff {
+        // Match with remaining
+        Some(itertools::Diff::Shorter(_, subpath)) => subpath,
+        _ => return None,
+    };
 
     let mut part_values = vec![];
-    for (path, pn) in subpath.zip(table_partition_cols) {
-        match path.split_once('=') {
+    for (part, pn) in subpath.zip(table_partition_cols) {
+        match part.split_once('=') {
             Some((name, val)) if name == pn => part_values.push(val),
             _ => return None,
         }
@@ -397,10 +458,8 @@ fn parse_partitions_for_path<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        logical_plan::{case, col, lit},
-        test::object_store::TestObjectStore,
-    };
+    use crate::logical_plan::{case, col, lit};
+    use crate::test::object_store::make_in_memory_store;
 
     use super::*;
 
@@ -446,29 +505,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_pruned_partition_list_empty() {
-        let store = TestObjectStore::new_arc(&[
+        let store = make_in_memory_store([
             ("tablepath/mypartition=val1/notparquetfile", 100),
             ("tablepath/file.parquet", 100),
         ]);
         let filter = Expr::eq(col("mypartition"), lit("val1"));
         let pruned = pruned_partition_list(
             store.as_ref(),
-            "tablepath/",
+            &ListingTableUrl::parse("file:///tablepath/").unwrap(),
             &[filter],
             ".parquet",
             &[String::from("mypartition")],
         )
         .await
         .expect("partition pruning failed")
-        .collect::<Vec<_>>()
-        .await;
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
         assert_eq!(pruned.len(), 0);
     }
 
     #[tokio::test]
     async fn test_pruned_partition_list() {
-        let store = TestObjectStore::new_arc(&[
+        let store = make_in_memory_store([
             ("tablepath/mypartition=val1/file.parquet", 100),
             ("tablepath/mypartition=val2/file.parquet", 100),
             ("tablepath/mypartition=val1/other=val3/file.parquet", 100),
@@ -476,66 +536,69 @@ mod tests {
         let filter = Expr::eq(col("mypartition"), lit("val1"));
         let pruned = pruned_partition_list(
             store.as_ref(),
-            "tablepath/",
+            &ListingTableUrl::parse("file:///tablepath/").unwrap(),
             &[filter],
             ".parquet",
             &[String::from("mypartition")],
         )
         .await
         .expect("partition pruning failed")
-        .collect::<Vec<_>>()
-        .await;
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
         assert_eq!(pruned.len(), 2);
-        let f1 = pruned[0].as_ref().expect("first item not an error");
+        let f1 = &pruned[0];
         assert_eq!(
-            &f1.file_meta.sized_file.path,
+            f1.object_meta.location.to_raw(),
             "tablepath/mypartition=val1/file.parquet"
         );
         assert_eq!(
             &f1.partition_values,
             &[ScalarValue::Utf8(Some(String::from("val1"))),]
         );
-        let f2 = pruned[1].as_ref().expect("second item not an error");
+        let f2 = &pruned[1];
         assert_eq!(
-            &f2.file_meta.sized_file.path,
+            f2.object_meta.location.to_raw(),
             "tablepath/mypartition=val1/other=val3/file.parquet"
         );
         assert_eq!(
-            &f2.partition_values,
+            f2.partition_values,
             &[ScalarValue::Utf8(Some(String::from("val1"))),]
         );
     }
 
     #[tokio::test]
     async fn test_pruned_partition_list_multi() {
-        let store = TestObjectStore::new_arc(&[
+        let store = make_in_memory_store([
             ("tablepath/part1=p1v1/file.parquet", 100),
             ("tablepath/part1=p1v2/part2=p2v1/file1.parquet", 100),
             ("tablepath/part1=p1v2/part2=p2v1/file2.parquet", 100),
             ("tablepath/part1=p1v3/part2=p2v1/file2.parquet", 100),
             ("tablepath/part1=p1v2/part2=p2v2/file2.parquet", 100),
         ]);
+
         let filter1 = Expr::eq(col("part1"), lit("p1v2"));
         let filter2 = Expr::eq(col("part2"), lit("p2v1"));
         // filter3 cannot be resolved at partition pruning
         let filter3 = Expr::eq(col("part2"), col("other"));
         let pruned = pruned_partition_list(
             store.as_ref(),
-            "tablepath/",
+            &ListingTableUrl::parse("file:///tablepath/").unwrap(),
             &[filter1, filter2, filter3],
             ".parquet",
             &[String::from("part1"), String::from("part2")],
         )
         .await
         .expect("partition pruning failed")
-        .collect::<Vec<_>>()
-        .await;
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
         assert_eq!(pruned.len(), 2);
-        let f1 = pruned[0].as_ref().expect("first item not an error");
+        let f1 = &pruned[1];
         assert_eq!(
-            &f1.file_meta.sized_file.path,
+            f1.object_meta.location.to_raw(),
             "tablepath/part1=p1v2/part2=p2v1/file1.parquet"
         );
         assert_eq!(
@@ -545,9 +608,9 @@ mod tests {
                 ScalarValue::Utf8(Some(String::from("p2v1")))
             ]
         );
-        let f2 = pruned[1].as_ref().expect("second item not an error");
+        let f2 = &pruned[1];
         assert_eq!(
-            &f2.file_meta.sized_file.path,
+            f2.object_meta.location.to_raw(),
             "tablepath/part1=p1v2/part2=p2v1/file2.parquet"
         );
         assert_eq!(
@@ -563,37 +626,41 @@ mod tests {
     fn test_parse_partitions_for_path() {
         assert_eq!(
             Some(vec![]),
-            parse_partitions_for_path("bucket/mytable", "bucket/mytable/file.csv", &[])
-        );
-        assert_eq!(
-            None,
             parse_partitions_for_path(
-                "bucket/othertable",
-                "bucket/mytable/file.csv",
+                &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
+                &Path::from_raw("bucket/mytable/file.csv"),
                 &[]
             )
         );
         assert_eq!(
             None,
             parse_partitions_for_path(
-                "bucket/mytable",
-                "bucket/mytable/file.csv",
+                &ListingTableUrl::parse("file:///bucket/othertable").unwrap(),
+                &Path::from_raw("bucket/mytable/file.csv"),
+                &[]
+            )
+        );
+        assert_eq!(
+            None,
+            parse_partitions_for_path(
+                &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
+                &Path::from_raw("bucket/mytable/file.csv"),
                 &[String::from("mypartition")]
             )
         );
         assert_eq!(
             Some(vec!["v1"]),
             parse_partitions_for_path(
-                "bucket/mytable",
-                "bucket/mytable/mypartition=v1/file.csv",
+                &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
+                &Path::from_raw("bucket/mytable/mypartition=v1/file.csv"),
                 &[String::from("mypartition")]
             )
         );
         assert_eq!(
             Some(vec!["v1"]),
             parse_partitions_for_path(
-                "bucket/mytable/",
-                "bucket/mytable/mypartition=v1/file.csv",
+                &ListingTableUrl::parse("file:///bucket/mytable/").unwrap(),
+                &Path::from_raw("bucket/mytable/mypartition=v1/file.csv"),
                 &[String::from("mypartition")]
             )
         );
@@ -601,46 +668,29 @@ mod tests {
         assert_eq!(
             None,
             parse_partitions_for_path(
-                "bucket/mytable",
-                "bucket/mytable/v1/file.csv",
+                &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
+                &Path::from_raw("bucket/mytable/v1/file.csv"),
                 &[String::from("mypartition")]
             )
         );
         assert_eq!(
             Some(vec!["v1", "v2"]),
             parse_partitions_for_path(
-                "bucket/mytable",
-                "bucket/mytable/mypartition=v1/otherpartition=v2/file.csv",
+                &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
+                &Path::from_raw(
+                    "bucket/mytable/mypartition=v1/otherpartition=v2/file.csv"
+                ),
                 &[String::from("mypartition"), String::from("otherpartition")]
             )
         );
         assert_eq!(
             Some(vec!["v1"]),
             parse_partitions_for_path(
-                "bucket/mytable",
-                "bucket/mytable/mypartition=v1/otherpartition=v2/file.csv",
+                &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
+                &Path::from_raw(
+                    "bucket/mytable/mypartition=v1/otherpartition=v2/file.csv"
+                ),
                 &[String::from("mypartition")]
-            )
-        );
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn test_parse_partitions_for_path_windows() {
-        assert_eq!(
-            Some(vec!["v1"]),
-            parse_partitions_for_path(
-                "bucket\\mytable",
-                "bucket\\mytable\\mypartition=v1\\file.csv",
-                &[String::from("mypartition")]
-            )
-        );
-        assert_eq!(
-            Some(vec!["v1", "v2"]),
-            parse_partitions_for_path(
-                "bucket\\mytable",
-                "bucket\\mytable\\mypartition=v1\\otherpartition=v2\\file.csv",
-                &[String::from("mypartition"), String::from("otherpartition")]
             )
         );
     }
@@ -648,23 +698,19 @@ mod tests {
     #[test]
     fn test_path_batch_roundtrip_no_partiton() {
         let files = vec![
-            FileMeta {
-                sized_file: SizedFile {
-                    path: String::from("mybucket/tablepath/part1=val1/file.parquet"),
-                    size: 100,
-                },
-                last_modified: Some(Utc.timestamp_millis(1634722979123)),
+            ObjectMeta {
+                location: Path::from_raw("mybucket/tablepath/part1=val1/file.parquet"),
+                last_modified: Utc.timestamp_millis(1634722979123),
+                size: 100,
             },
-            FileMeta {
-                sized_file: SizedFile {
-                    path: String::from("mybucket/tablepath/part1=val2/file.parquet"),
-                    size: 100,
-                },
-                last_modified: None,
+            ObjectMeta {
+                location: Path::from_raw("mybucket/tablepath/part1=val2/file.parquet"),
+                last_modified: Utc.timestamp_nanos(0),
+                size: 100,
             },
         ];
-
-        let batches = paths_to_batch(&[], "mybucket/tablepath", &files)
+        let table_path = ListingTableUrl::parse("file:///mybucket/tablepath").unwrap();
+        let batches = paths_to_batch(&[], &table_path, &files)
             .expect("Serialization of file list to batch failed");
 
         let parsed_files = batches_to_paths(&[batches]);
@@ -674,33 +720,38 @@ mod tests {
 
         let parsed_metas = parsed_files
             .into_iter()
-            .map(|pf| pf.file_meta)
+            .map(|pf| pf.object_meta)
             .collect::<Vec<_>>();
-        assert_eq!(parsed_metas, files);
+        // TODO: assert_eq!(parsed_metas, files)
+        assert_eq!(parsed_metas.len(), files.len());
+        for (parsed, file) in parsed_metas.into_iter().zip(files) {
+            assert_eq!(parsed.location, file.location);
+            assert_eq!(parsed.size, file.size);
+            assert_eq!(parsed.last_modified, file.last_modified)
+        }
     }
 
     #[test]
     fn test_path_batch_roundtrip_with_partition() {
         let files = vec![
-            FileMeta {
-                sized_file: SizedFile {
-                    path: String::from("mybucket/tablepath/part1=val1/file.parquet"),
-                    size: 100,
-                },
-                last_modified: Some(Utc.timestamp_millis(1634722979123)),
+            ObjectMeta {
+                location: Path::from_raw("mybucket/tablepath/part1=val1/file.parquet"),
+                last_modified: Utc.timestamp_millis(1634722979123),
+                size: 100,
             },
-            FileMeta {
-                sized_file: SizedFile {
-                    path: String::from("mybucket/tablepath/part1=val2/file.parquet"),
-                    size: 100,
-                },
-                last_modified: None,
+            ObjectMeta {
+                location: Path::from_raw("mybucket/tablepath/part1=val2/file.parquet"),
+                last_modified: Utc.timestamp_nanos(0),
+                size: 100,
             },
         ];
 
-        let batches =
-            paths_to_batch(&[String::from("part1")], "mybucket/tablepath", &files)
-                .expect("Serialization of file list to batch failed");
+        let batches = paths_to_batch(
+            &[String::from("part1")],
+            &ListingTableUrl::parse("file:///mybucket/tablepath").unwrap(),
+            &files,
+        )
+        .expect("Serialization of file list to batch failed");
 
         let parsed_files = batches_to_paths(&[batches]);
         assert_eq!(parsed_files.len(), 2);
@@ -715,9 +766,15 @@ mod tests {
 
         let parsed_metas = parsed_files
             .into_iter()
-            .map(|pf| pf.file_meta)
+            .map(|pf| pf.object_meta)
             .collect::<Vec<_>>();
-        assert_eq!(parsed_metas, files);
+        // TODO: assert_eq!(parsed_metas, files)
+        assert_eq!(parsed_metas.len(), files.len());
+        for (parsed, file) in parsed_metas.into_iter().zip(files) {
+            assert_eq!(parsed.location, file.location);
+            assert_eq!(parsed.size, file.size);
+            assert_eq!(parsed.last_modified, file.last_modified)
+        }
     }
 
     #[test]

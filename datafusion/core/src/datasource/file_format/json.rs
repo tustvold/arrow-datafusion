@@ -26,17 +26,17 @@ use arrow::datatypes::SchemaRef;
 use arrow::json::reader::infer_json_schema_from_iterator;
 use arrow::json::reader::ValueIter;
 use async_trait::async_trait;
-use futures::StreamExt;
+use object_store::{ObjectMeta, ObjectStore};
 
 use super::FileFormat;
 use super::FileScanConfig;
 use crate::datasource::file_format::DEFAULT_SCHEMA_INFER_MAX_RECORD;
+use crate::datasource::local::fetch_to_local_file;
 use crate::error::Result;
 use crate::logical_plan::Expr;
 use crate::physical_plan::file_format::NdJsonExec;
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::Statistics;
-use datafusion_data_access::object_store::{ObjectReader, ObjectReaderStream};
 
 /// The default file extension of json files
 pub const DEFAULT_JSON_EXTENSION: &str = ".json";
@@ -69,11 +69,16 @@ impl FileFormat for JsonFormat {
         self
     }
 
-    async fn infer_schema(&self, mut readers: ObjectReaderStream) -> Result<SchemaRef> {
+    async fn infer_schema(
+        &self,
+        store: &dyn ObjectStore,
+        files: &[ObjectMeta],
+    ) -> Result<SchemaRef> {
         let mut schemas = Vec::new();
         let mut records_to_read = self.schema_infer_max_rec.unwrap_or(usize::MAX);
-        while let Some(obj_reader) = readers.next().await {
-            let mut reader = BufReader::new(obj_reader?.sync_reader()?);
+        for file in files {
+            let file = fetch_to_local_file(store, &file.location).await?;
+            let mut reader = BufReader::new(file);
             let iter = ValueIter::new(&mut reader, None);
             let schema = infer_json_schema_from_iterator(iter.take_while(|_| {
                 let should_take = records_to_read > 0;
@@ -94,8 +99,9 @@ impl FileFormat for JsonFormat {
 
     async fn infer_stats(
         &self,
-        _reader: Arc<dyn ObjectReader>,
+        _store: &dyn ObjectStore,
         _table_schema: SchemaRef,
+        _file: &ObjectMeta,
     ) -> Result<Statistics> {
         Ok(Statistics::default())
     }
@@ -113,23 +119,21 @@ impl FileFormat for JsonFormat {
 #[cfg(test)]
 mod tests {
     use arrow::array::Int64Array;
+    use futures::StreamExt;
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
 
     use super::*;
+    use crate::datasource::file_format::test_util::get_exec_format;
+    use crate::physical_plan::collect;
     use crate::prelude::{SessionConfig, SessionContext};
-    use crate::{
-        datafusion_data_access::object_store::local::{
-            local_object_reader, local_object_reader_stream, LocalFileSystem,
-        },
-        datasource::{file_format::FileScanConfig, listing::local_unpartitioned_file},
-        physical_plan::collect,
-    };
 
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
         let config = SessionConfig::new().with_batch_size(2);
         let ctx = SessionContext::with_config(config);
         let projection = None;
-        let exec = get_exec(&projection, None).await?;
+        let exec = get_exec(projection, None).await?;
         let task_ctx = ctx.task_ctx();
         let stream = exec.execute(0, task_ctx)?;
 
@@ -156,7 +160,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let projection = None;
-        let exec = get_exec(&projection, Some(1)).await?;
+        let exec = get_exec(projection, Some(1)).await?;
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());
         assert_eq!(4, batches[0].num_columns());
@@ -168,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn infer_schema() -> Result<()> {
         let projection = None;
-        let exec = get_exec(&projection, None).await?;
+        let exec = get_exec(projection, None).await?;
 
         let x: Vec<String> = exec
             .schema()
@@ -185,8 +189,8 @@ mod tests {
     async fn read_int_column() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let projection = Some(vec![0]);
-        let exec = get_exec(&projection, None).await?;
+        let projection: Option<&[usize]> = Some(&[0]);
+        let exec = get_exec(projection, None).await?;
 
         let batches = collect(exec, task_ctx).await.expect("Collect batches");
 
@@ -213,46 +217,22 @@ mod tests {
     }
 
     async fn get_exec(
-        projection: &Option<Vec<usize>>,
+        projection: Option<&[usize]>,
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let filename = "tests/jsons/2.json";
         let format = JsonFormat::default();
-        let file_schema = format
-            .infer_schema(local_object_reader_stream(vec![filename.to_owned()]))
-            .await
-            .expect("Schema inference");
-        let statistics = format
-            .infer_stats(
-                local_object_reader(filename.to_owned()),
-                file_schema.clone(),
-            )
-            .await
-            .expect("Stats inference");
-        let file_groups = vec![vec![local_unpartitioned_file(filename.to_owned())]];
-        let exec = format
-            .create_physical_plan(
-                FileScanConfig {
-                    object_store: Arc::new(LocalFileSystem {}),
-                    file_schema,
-                    file_groups,
-                    statistics,
-                    projection: projection.clone(),
-                    limit,
-                    table_partition_cols: vec![],
-                },
-                &[],
-            )
-            .await?;
-        Ok(exec)
+        get_exec_format(&format, ".", filename, projection, limit).await
     }
 
     #[tokio::test]
     async fn infer_schema_with_limit() {
+        let store = Arc::new(LocalFileSystem::new("."));
         let filename = "tests/jsons/schema_infer_limit.json";
         let format = JsonFormat::default().with_schema_infer_max_rec(Some(3));
+        let meta = store.head(&Path::from_raw(filename)).await.unwrap();
         let file_schema = format
-            .infer_schema(local_object_reader_stream(vec![filename.to_owned()]))
+            .infer_schema(store.as_ref(), &[meta])
             .await
             .expect("Schema inference");
         let fields = file_schema

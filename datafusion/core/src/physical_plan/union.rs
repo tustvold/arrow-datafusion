@@ -254,8 +254,8 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
 
         // Create csv's with different partitioning
-        let csv = test::scan_partitioned_csv(4)?;
-        let csv2 = test::scan_partitioned_csv(5)?;
+        let csv = test::scan_partitioned_csv(4).await?;
+        let csv2 = test::scan_partitioned_csv(5).await?;
 
         let union_exec = Arc::new(UnionExec::new(vec![csv, csv2]));
 

@@ -18,18 +18,20 @@
 //! Common unit test utility methods
 
 use crate::arrow::array::UInt32Array;
-use crate::datasource::{listing::local_unpartitioned_file, MemTable, TableProvider};
+use crate::datasource::{MemTable, TableProvider};
 use crate::error::Result;
 use crate::from_slice::FromSlice;
 use crate::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 use crate::physical_plan::file_format::{CsvExec, FileScanConfig};
 use crate::test_util::aggr_test_schema;
+use ::object_store::local::LocalFileSystem;
+use ::object_store::path::Path;
+use ::object_store::ObjectStore;
 use array::{Array, ArrayRef};
 use arrow::array::{self, DecimalBuilder, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_data_access::object_store::local::LocalFileSystem;
-use futures::{Future, FutureExt};
+use futures::{Future, FutureExt, TryStreamExt};
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
@@ -55,22 +57,23 @@ pub fn create_table_dual() -> Arc<dyn TableProvider> {
 }
 
 /// Returns a [`CsvExec`] that scans "aggregate_test_100.csv" with `partitions` partitions
-pub fn scan_partitioned_csv(partitions: usize) -> Result<Arc<CsvExec>> {
+pub async fn scan_partitioned_csv(partitions: usize) -> Result<Arc<CsvExec>> {
     let schema = aggr_test_schema();
-    let config = partitioned_csv_config("aggregate_test_100.csv", schema, partitions)?;
+    let config =
+        partitioned_csv_config("aggregate_test_100.csv", schema, partitions).await?;
     Ok(Arc::new(CsvExec::new(config, true, b',')))
 }
 
 /// Returns a [`FileScanConfig`] for scanning `partitions` partitions of `filename`
-pub fn partitioned_csv_config(
+pub async fn partitioned_csv_config(
     filename: &str,
     schema: SchemaRef,
     partitions: usize,
 ) -> Result<FileScanConfig> {
-    let testdata = crate::test_util::arrow_test_data();
-    let path = format!("{}/csv/{}", testdata, filename);
+    let root = format!("{}/csv", crate::test_util::arrow_test_data());
+    let path = format!("{}/{}", root, filename);
 
-    let file_groups = if partitions > 1 {
+    let (store, file_groups) = if partitions > 1 {
         let tmp_dir = TempDir::new()?.into_path();
 
         let mut writers = vec![];
@@ -106,16 +109,27 @@ pub fn partitioned_csv_config(
             w.flush().unwrap();
         }
 
-        files
-            .into_iter()
-            .map(|f| vec![local_unpartitioned_file(f.to_str().unwrap().to_owned())])
-            .collect::<Vec<_>>()
+        let root_path = tmp_dir.to_string_lossy();
+        let store = Arc::new(LocalFileSystem::new(root_path.as_ref()));
+
+        let files = store
+            .list(None)
+            .await
+            .unwrap()
+            .map_ok(|object_meta| vec![object_meta.into()])
+            .try_collect()
+            .await
+            .unwrap();
+
+        (store, files)
     } else {
-        vec![vec![local_unpartitioned_file(path)]]
+        let store = Arc::new(LocalFileSystem::new(root));
+        let object_meta = store.head(&Path::from_raw(filename)).await.unwrap();
+        (store, vec![vec![object_meta.into()]])
     };
 
     Ok(FileScanConfig {
-        object_store: Arc::new(LocalFileSystem {}),
+        object_store: store,
         file_schema: schema,
         file_groups,
         statistics: Default::default(),

@@ -23,11 +23,11 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::datasource::listing::{ListingTable, ListingTableConfig};
+use crate::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use crate::datasource::object_store_registry::ObjectStoreRegistry;
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
-use datafusion_data_access::object_store::ObjectStore;
+use object_store::ObjectStore;
 
 /// Represents a schema, comprising a number of named tables.
 pub trait SchemaProvider: Sync + Send {
@@ -157,10 +157,7 @@ impl ObjectStoreSchemaProvider {
     }
 
     /// Retrieves a `ObjectStore` instance by scheme
-    pub fn object_store<'a>(
-        &self,
-        uri: &'a str,
-    ) -> Result<(Arc<dyn ObjectStore>, &'a str)> {
+    pub fn object_store(&self, uri: &ListingTableUrl) -> Result<Arc<dyn ObjectStore>> {
         self.object_store_registry
             .lock()
             .get_by_uri(uri)
@@ -173,13 +170,13 @@ impl ObjectStoreSchemaProvider {
     pub async fn register_listing_table(
         &self,
         name: &str,
-        uri: &str,
+        uri: ListingTableUrl,
         config: Option<ListingTableConfig>,
     ) -> Result<()> {
         let config = match config {
             Some(cfg) => cfg,
             None => {
-                let (object_store, _path) = self.object_store(uri)?;
+                let object_store = self.object_store(&uri)?;
                 ListingTableConfig::new(object_store, uri).infer().await?
             }
         };
@@ -239,8 +236,6 @@ impl SchemaProvider for ObjectStoreSchemaProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-    use std::path::Path;
     use std::sync::Arc;
 
     use arrow::datatypes::Schema;
@@ -251,11 +246,15 @@ mod tests {
     use crate::catalog::schema::{
         MemorySchemaProvider, ObjectStoreSchemaProvider, SchemaProvider,
     };
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
     use crate::datasource::empty::EmptyTable;
     use crate::execution::context::SessionContext;
 
+    use crate::datasource::listing::ListingTableUrl;
     use futures::StreamExt;
+    use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
 
     #[tokio::test]
     async fn test_mem_provider() {
@@ -280,12 +279,13 @@ mod tests {
     async fn test_schema_register_listing_table() {
         let testdata = crate::test_util::parquet_test_data();
         let filename = format!("{}/{}", testdata, "alltypes_plain.parquet");
+        let uri = ListingTableUrl::parse(filename).unwrap();
 
         let schema = ObjectStoreSchemaProvider::new();
-        let _store = schema.register_object_store("test", Arc::new(LocalFileSystem {}));
+        let _store = schema.register_object_store("test", Arc::new(InMemory::new()));
 
         schema
-            .register_listing_table("alltypes_plain", &filename, None)
+            .register_listing_table("alltypes_plain", uri, None)
             .await
             .unwrap();
 
@@ -323,23 +323,24 @@ mod tests {
     #[tokio::test]
     async fn test_schema_register_listing_tables() {
         let testdata = crate::test_util::parquet_test_data();
+        let store = Arc::new(LocalFileSystem::new("/"));
 
         let schema = ObjectStoreSchemaProvider::new();
-        let store = schema
-            .register_object_store("file", Arc::new(LocalFileSystem {}))
-            .unwrap();
+        schema.register_object_store("file", store.clone()).unwrap();
 
-        let mut files = store.list_file(&testdata).await.unwrap();
-        while let Some(file) = files.next().await {
-            let sized_file = file.unwrap().sized_file;
-            let path = Path::new(&sized_file.path);
-            let file = path.file_name().unwrap();
-            if file == OsStr::new("alltypes_dictionary.parquet")
-                || file == OsStr::new("alltypes_plain.parquet")
+        let prefix = Path::from_raw(testdata);
+        let mut files = store.list(Some(&prefix)).await.unwrap();
+        while let Some(meta_result) = files.next().await {
+            let meta = meta_result.unwrap();
+            let file = meta.location.parts().last().unwrap().to_string();
+
+            if &file == "alltypes_dictionary.parquet" || &file == "alltypes_plain.parquet"
             {
-                let name = path.file_stem().unwrap().to_str().unwrap();
+                let name = file.strip_suffix(".parquet").unwrap();
+                let path = ListingTableUrl::parse(format!("/{}", meta.location)).unwrap();
+
                 schema
-                    .register_listing_table(name, &sized_file.path, None)
+                    .register_listing_table(name, path, None)
                     .await
                     .unwrap();
             }
@@ -360,17 +361,18 @@ mod tests {
     async fn test_schema_register_same_listing_table() {
         let testdata = crate::test_util::parquet_test_data();
         let filename = format!("{}/{}", testdata, "alltypes_plain.parquet");
+        let uri = ListingTableUrl::parse(filename).unwrap();
 
         let schema = ObjectStoreSchemaProvider::new();
-        let _store = schema.register_object_store("test", Arc::new(LocalFileSystem {}));
+        let _store = schema.register_object_store("test", Arc::new(InMemory::new()));
 
         schema
-            .register_listing_table("alltypes_plain", &filename, None)
+            .register_listing_table("alltypes_plain", uri.clone(), None)
             .await
             .unwrap();
 
         schema
-            .register_listing_table("alltypes_plain", &filename, None)
+            .register_listing_table("alltypes_plain", uri, None)
             .await
             .unwrap();
     }

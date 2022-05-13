@@ -17,18 +17,16 @@
 
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::listing::local_unpartitioned_file;
 use datafusion::error::Result;
 use datafusion::physical_plan::file_format::FileScanConfig;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use datafusion_data_access::object_store::local::LocalFileSystem;
-use datafusion_data_access::object_store::local::{
-    local_object_reader, local_object_reader_stream,
-};
 use datafusion_row::layout::RowType::{Compact, WordAligned};
 use datafusion_row::reader::read_as_batch;
 use datafusion_row::writer::write_batch_unchecked;
+use object_store::local::LocalFileSystem;
+use object_store::path::Path;
+use object_store::{ObjectMeta, ObjectStore};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -79,21 +77,34 @@ async fn get_exec(
     limit: Option<usize>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let testdata = datafusion::test_util::parquet_test_data();
-    let filename = format!("{}/{}", testdata, file_name);
+    let store = Arc::new(LocalFileSystem::new(testdata));
     let format = ParquetFormat::default();
+    let path = Path::from_raw(file_name);
+
+    let meta = store.head(&path).await.unwrap();
+
     let file_schema = format
-        .infer_schema(local_object_reader_stream(vec![filename.clone()]))
+        .infer_schema(
+            store.as_ref(),
+            &[ObjectMeta {
+                location: meta.location.clone(),
+                last_modified: meta.last_modified,
+                size: meta.size,
+            }],
+        )
         .await
         .expect("Schema inference");
+
     let statistics = format
-        .infer_stats(local_object_reader(filename.clone()), file_schema.clone())
+        .infer_stats(store.as_ref(), file_schema.clone(), &meta)
         .await
         .expect("Stats inference");
-    let file_groups = vec![vec![local_unpartitioned_file(filename.clone())]];
+
+    let file_groups = vec![vec![meta.into()]];
     let exec = format
         .create_physical_plan(
             FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
+                object_store: store,
                 file_schema,
                 file_groups,
                 statistics,

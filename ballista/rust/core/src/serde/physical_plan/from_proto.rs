@@ -285,7 +285,7 @@ impl TryFrom<&protobuf::PartitionedFile> for PartitionedFile {
 
     fn try_from(val: &protobuf::PartitionedFile) -> Result<Self, Self::Error> {
         Ok(PartitionedFile {
-            file_meta: FileMeta {
+            object_meta: FileMeta {
                 sized_file: SizedFile {
                     path: val.path.clone(),
                     size: val.size,

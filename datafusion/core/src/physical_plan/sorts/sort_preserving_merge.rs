@@ -896,7 +896,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions).unwrap();
+        let csv = test::scan_partitioned_csv(partitions).await.unwrap();
         let schema = csv.schema();
 
         let sort = vec![
@@ -968,7 +968,7 @@ mod tests {
         context: Arc<TaskContext>,
     ) -> Arc<dyn ExecutionPlan> {
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions).unwrap();
+        let csv = test::scan_partitioned_csv(partitions).await.unwrap();
 
         let sorted = basic_sort(csv, sort, context).await;
         let split: Vec<_> = sizes.iter().map(|x| split_batch(&sorted, *x)).collect();

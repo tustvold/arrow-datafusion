@@ -25,6 +25,7 @@ pub mod listing;
 pub mod memory;
 pub mod object_store_registry;
 pub mod view;
+pub(crate) mod local;
 
 use futures::Stream;
 

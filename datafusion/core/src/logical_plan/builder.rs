@@ -35,7 +35,7 @@ use arrow::{
     datatypes::{DataType, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use datafusion_data_access::object_store::ObjectStore;
+use object_store::ObjectStore;
 use std::convert::TryFrom;
 use std::iter;
 use std::{
@@ -44,6 +44,7 @@ use std::{
 };
 
 use super::{Expr, JoinConstraint, JoinType, LogicalPlan, PlanType};
+use crate::datasource::listing::ListingTableUrl;
 use crate::logical_plan::expr::exprlist_to_fields;
 use crate::logical_plan::{
     columnize_expr, normalize_col, normalize_cols, provider_as_source,
@@ -207,18 +208,18 @@ impl LogicalPlanBuilder {
     /// Scan a CSV data source
     pub async fn scan_csv(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: CsvReadOptions<'_>,
         projection: Option<Vec<usize>>,
         target_partitions: usize,
     ) -> Result<Self> {
-        let path = path.into();
+        let table_name = path.table_name()?.to_string();
         Self::scan_csv_with_name(
             object_store,
-            path.clone(),
+            path,
             options,
             projection,
-            path,
+            table_name,
             target_partitions,
         )
         .await
@@ -227,15 +228,13 @@ impl LogicalPlanBuilder {
     /// Scan a CSV data source and register it with a given table name
     pub async fn scan_csv_with_name(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: CsvReadOptions<'_>,
         projection: Option<Vec<usize>>,
         table_name: impl Into<String>,
         target_partitions: usize,
     ) -> Result<Self> {
         let listing_options = options.to_listing_options(target_partitions);
-
-        let path: String = path.into();
 
         let resolved_schema = match options.schema {
             Some(s) => Arc::new(s.to_owned()),
@@ -256,19 +255,19 @@ impl LogicalPlanBuilder {
     /// Scan a Parquet data source
     pub async fn scan_parquet(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: ParquetReadOptions<'_>,
         projection: Option<Vec<usize>>,
         target_partitions: usize,
     ) -> Result<Self> {
-        let path = path.into();
+        let table_name = path.table_name()?.to_string();
         Self::scan_parquet_with_name(
             object_store,
-            path.clone(),
+            path,
             options,
             projection,
             target_partitions,
-            path,
+            table_name,
         )
         .await
     }
@@ -276,14 +275,13 @@ impl LogicalPlanBuilder {
     /// Scan a Parquet data source and register it with a given table name
     pub async fn scan_parquet_with_name(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: ParquetReadOptions<'_>,
         projection: Option<Vec<usize>>,
         target_partitions: usize,
         table_name: impl Into<String>,
     ) -> Result<Self> {
         let listing_options = options.to_listing_options(target_partitions);
-        let path: String = path.into();
 
         // with parquet we resolve the schema in all cases
         let resolved_schema = listing_options
@@ -301,18 +299,18 @@ impl LogicalPlanBuilder {
     /// Scan an Avro data source
     pub async fn scan_avro(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: AvroReadOptions<'_>,
         projection: Option<Vec<usize>>,
         target_partitions: usize,
     ) -> Result<Self> {
-        let path = path.into();
+        let table_name = path.table_name()?.to_string();
         Self::scan_avro_with_name(
             object_store,
-            path.clone(),
+            path,
             options,
             projection,
-            path,
+            table_name,
             target_partitions,
         )
         .await
@@ -321,15 +319,13 @@ impl LogicalPlanBuilder {
     /// Scan an Avro data source and register it with a given table name
     pub async fn scan_avro_with_name(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: AvroReadOptions<'_>,
         projection: Option<Vec<usize>>,
         table_name: impl Into<String>,
         target_partitions: usize,
     ) -> Result<Self> {
         let listing_options = options.to_listing_options(target_partitions);
-
-        let path: String = path.into();
 
         let resolved_schema = match options.schema {
             Some(s) => s,
@@ -350,18 +346,18 @@ impl LogicalPlanBuilder {
     /// Scan an Json data source
     pub async fn scan_json(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: NdJsonReadOptions<'_>,
         projection: Option<Vec<usize>>,
         target_partitions: usize,
     ) -> Result<Self> {
-        let path = path.into();
+        let table_name = path.table_name()?.to_string();
         Self::scan_json_with_name(
             object_store,
-            path.clone(),
+            path,
             options,
             projection,
-            path,
+            table_name,
             target_partitions,
         )
         .await
@@ -370,15 +366,13 @@ impl LogicalPlanBuilder {
     /// Scan an Json data source and register it with a given table name
     pub async fn scan_json_with_name(
         object_store: Arc<dyn ObjectStore>,
-        path: impl Into<String>,
+        path: ListingTableUrl,
         options: NdJsonReadOptions<'_>,
         projection: Option<Vec<usize>>,
         table_name: impl Into<String>,
         target_partitions: usize,
     ) -> Result<Self> {
         let listing_options = options.to_listing_options(target_partitions);
-
-        let path: String = path.into();
 
         let resolved_schema = match options.schema {
             Some(s) => s,

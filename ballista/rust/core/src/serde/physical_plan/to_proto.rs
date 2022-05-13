@@ -349,10 +349,10 @@ impl TryFrom<&PartitionedFile> for protobuf::PartitionedFile {
 
     fn try_from(pf: &PartitionedFile) -> Result<Self, Self::Error> {
         Ok(protobuf::PartitionedFile {
-            path: pf.file_meta.path().to_owned(),
-            size: pf.file_meta.size(),
+            path: pf.object_meta.path().to_owned(),
+            size: pf.object_meta.size(),
             last_modified_ns: pf
-                .file_meta
+                .object_meta
                 .last_modified
                 .map(|ts| ts.timestamp_nanos() as u64)
                 .unwrap_or(0),

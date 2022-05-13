@@ -166,8 +166,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use futures::FutureExt;
 
-    fn create_test_schema(partitions: usize) -> Result<(Arc<CsvExec>, SchemaRef)> {
-        let csv = test::scan_partitioned_csv(partitions)?;
+    async fn create_test_schema(partitions: usize) -> Result<(Arc<CsvExec>, SchemaRef)> {
+        let csv = test::scan_partitioned_csv(partitions).await?;
         let schema = csv.schema();
         Ok((csv, schema))
     }
@@ -176,7 +176,7 @@ mod tests {
     async fn window_function() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let (input, schema) = create_test_schema(1)?;
+        let (input, schema) = create_test_schema(1).await?;
 
         let window_exec = Arc::new(WindowAggExec::try_new(
             vec![

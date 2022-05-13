@@ -24,6 +24,7 @@ use crate::physical_plan::{
     DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
 };
 
+use crate::physical_plan::file_format::file_stream::FileStream;
 use arrow::csv;
 use arrow::datatypes::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
@@ -33,7 +34,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::task::{self, JoinHandle};
 
-use super::file_stream::{BatchIter, FileStream};
 use super::FileScanConfig;
 
 /// Execution plan for scanning a CSV file
@@ -120,31 +120,22 @@ impl ExecutionPlan for CsvExec {
         let file_projection = self.base_config.file_column_projection_indices();
         let has_header = self.has_header;
         let delimiter = self.delimiter;
-        let start_line = if has_header { 1 } else { 0 };
 
-        let fun = move |file, remaining: &Option<usize>| {
-            let bounds = remaining.map(|x| (0, x + start_line));
+        let fun = move |file| {
             let datetime_format = None;
-            Box::new(csv::Reader::new(
+            Ok(csv::Reader::new(
                 file,
                 Arc::clone(&file_schema),
                 has_header,
                 Some(delimiter),
                 batch_size,
-                bounds,
+                None,
                 file_projection.clone(),
                 datetime_format,
-            )) as BatchIter
+            ))
         };
 
-        Ok(Box::pin(FileStream::new(
-            Arc::clone(&self.base_config.object_store),
-            self.base_config.file_groups[partition].clone(),
-            fun,
-            Arc::clone(&self.projected_schema),
-            self.base_config.limit,
-            self.base_config.table_partition_cols.clone(),
-        )))
+        Ok(Box::pin(FileStream::new(&self.base_config, partition, fun)))
     }
 
     fn fmt_as(
@@ -228,7 +219,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema();
         let filename = "aggregate_test_100.csv";
-        let mut config = partitioned_csv_config(filename, file_schema, 1)?;
+        let mut config = partitioned_csv_config(filename, file_schema, 1).await?;
         config.projection = Some(vec![0, 2, 4]);
 
         let csv = CsvExec::new(config, true, b',');
@@ -264,7 +255,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema();
         let filename = "aggregate_test_100.csv";
-        let mut config = partitioned_csv_config(filename, file_schema, 1)?;
+        let mut config = partitioned_csv_config(filename, file_schema, 1).await?;
         config.limit = Some(5);
 
         let csv = CsvExec::new(config, true, b',');
@@ -300,7 +291,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema_with_missing_col();
         let filename = "aggregate_test_100.csv";
-        let mut config = partitioned_csv_config(filename, file_schema, 1)?;
+        let mut config = partitioned_csv_config(filename, file_schema, 1).await?;
         config.limit = Some(5);
 
         let csv = CsvExec::new(config, true, b',');
@@ -336,7 +327,7 @@ mod tests {
         let task_ctx = session_ctx.task_ctx();
         let file_schema = aggr_test_schema();
         let filename = "aggregate_test_100.csv";
-        let mut config = partitioned_csv_config(filename, file_schema.clone(), 1)?;
+        let mut config = partitioned_csv_config(filename, file_schema.clone(), 1).await?;
 
         // Add partition columns
         config.table_partition_cols = vec!["date".to_owned()];

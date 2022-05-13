@@ -309,7 +309,7 @@ mod tests {
         let schema = test_util::aggr_test_schema();
 
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions)?;
+        let csv = test::scan_partitioned_csv(partitions).await?;
 
         // pick column c1 and name it column c1 in the output schema
         let projection =

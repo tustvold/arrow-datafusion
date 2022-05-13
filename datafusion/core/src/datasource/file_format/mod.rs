@@ -36,8 +36,7 @@ use crate::physical_plan::file_format::FileScanConfig;
 use crate::physical_plan::{ExecutionPlan, Statistics};
 
 use async_trait::async_trait;
-
-use datafusion_data_access::object_store::{ObjectReader, ObjectReaderStream};
+use object_store::{ObjectMeta, ObjectStore};
 
 /// This trait abstracts all the file format specific implementations
 /// from the `TableProvider`. This helps code re-utilization across
@@ -52,7 +51,11 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
     /// be analysed up to a given number of records or files (as specified in the
     /// format config) then give the estimated common schema. This might fail if
     /// the files have schemas that cannot be merged.
-    async fn infer_schema(&self, readers: ObjectReaderStream) -> Result<SchemaRef>;
+    async fn infer_schema(
+        &self,
+        store: &dyn ObjectStore,
+        files: &[ObjectMeta],
+    ) -> Result<SchemaRef>;
 
     /// Infer the statistics for the provided object. The cost and accuracy of the
     /// estimated statistics might vary greatly between file formats.
@@ -63,8 +66,9 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
     /// TODO: should the file source return statistics for only columns referred to in the table schema?
     async fn infer_stats(
         &self,
-        reader: Arc<dyn ObjectReader>,
+        store: &dyn ObjectStore,
         table_schema: SchemaRef,
+        file: &ObjectMeta,
     ) -> Result<Statistics>;
 
     /// Take a list of files and convert it to the appropriate executor
@@ -74,4 +78,64 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
         conf: FileScanConfig,
         filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>>;
+}
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use super::*;
+    use crate::datasource::listing::PartitionedFile;
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
+
+    pub async fn get_exec_format(
+        format: &dyn FileFormat,
+        store_root: &str,
+        file_name: &str,
+        projection: Option<&[usize]>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let store = Arc::new(LocalFileSystem::new(store_root));
+        let path = Path::from_raw(file_name);
+        let meta = store.head(&path).await.unwrap();
+
+        let file_schema = format
+            .infer_schema(
+                store.as_ref(),
+                // TODO: ObjectMeta clone
+                &[ObjectMeta {
+                    location: meta.location.clone(),
+                    last_modified: meta.last_modified,
+                    size: meta.size,
+                }],
+            )
+            .await
+            .expect("Schema inference");
+
+        let statistics = format
+            .infer_stats(store.as_ref(), file_schema.clone(), &meta)
+            .await
+            .expect("Stats inference");
+
+        let file_groups = vec![vec![PartitionedFile {
+            object_meta: meta,
+            partition_values: vec![],
+            range: None,
+        }]];
+
+        let exec = format
+            .create_physical_plan(
+                FileScanConfig {
+                    object_store: store,
+                    file_schema,
+                    file_groups,
+                    statistics,
+                    projection: projection.map(|x| x.to_vec()),
+                    limit,
+                    table_partition_cols: vec![],
+                },
+                &[],
+            )
+            .await?;
+        Ok(exec)
+    }
 }

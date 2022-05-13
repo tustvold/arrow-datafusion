@@ -16,23 +16,17 @@
 // under the License.
 
 //! Execution plan for reading line-delimited Avro files
-#[cfg(feature = "avro")]
-use crate::avro_to_arrow;
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::{
     DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
 };
 use arrow::datatypes::SchemaRef;
-#[cfg(feature = "avro")]
-use arrow::error::ArrowError;
 
 use crate::execution::context::TaskContext;
 use std::any::Any;
 use std::sync::Arc;
 
-#[cfg(feature = "avro")]
-use super::file_stream::{BatchIter, FileStream};
 use super::FileScanConfig;
 
 /// Execution plan for scanning Avro data source
@@ -109,35 +103,27 @@ impl ExecutionPlan for AvroExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        use super::file_stream::FileStream;
+        use arrow::error::ArrowError;
+
         let proj = self.base_config.projected_file_column_names();
 
         let batch_size = context.session_config().batch_size;
         let file_schema = Arc::clone(&self.base_config.file_schema);
 
         // The avro reader cannot limit the number of records, so `remaining` is ignored.
-        let fun = move |file, _remaining: &Option<usize>| {
-            let reader_res = avro_to_arrow::Reader::try_new(
+        let fun = move |file| {
+            let reader_res = crate::avro_to_arrow::Reader::try_new(
                 file,
                 Arc::clone(&file_schema),
                 batch_size,
                 proj.clone(),
-            );
-            match reader_res {
-                Ok(r) => Box::new(r) as BatchIter,
-                Err(e) => Box::new(
-                    vec![Err(ArrowError::ExternalError(Box::new(e)))].into_iter(),
-                ),
-            }
+            )?;
+
+            futures::stream::iter(reader_res)
         };
 
-        Ok(Box::pin(FileStream::new(
-            Arc::clone(&self.base_config.object_store),
-            self.base_config.file_groups[partition].clone(),
-            fun,
-            Arc::clone(&self.projected_schema),
-            self.base_config.limit,
-            self.base_config.table_partition_cols.clone(),
-        )))
+        Ok(Box::pin(FileStream::new(&self.base_config, partition, fun)))
     }
 
     fn fmt_as(

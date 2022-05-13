@@ -936,7 +936,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions)?;
+        let csv = test::scan_partitioned_csv(partitions).await?;
         let schema = csv.schema();
 
         let sort_exec = Arc::new(SortExec::try_new(
@@ -998,7 +998,7 @@ mod tests {
         let session_ctx = SessionContext::with_config_rt(SessionConfig::new(), runtime);
 
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions)?;
+        let csv = test::scan_partitioned_csv(partitions).await?;
         let schema = csv.schema();
 
         let sort_exec = Arc::new(SortExec::try_new(

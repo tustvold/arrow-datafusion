@@ -581,7 +581,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                                     .options()
                                     .table_partition_cols
                                     .clone(),
-                                path: listing_table.table_path().to_owned(),
+                                path: listing_table.table_path(),
                                 schema: Some(schema),
                                 projection,
                                 filters,

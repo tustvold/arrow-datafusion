@@ -252,7 +252,7 @@ mod tests {
         let schema = test_util::aggr_test_schema();
 
         let partitions = 4;
-        let csv = test::scan_partitioned_csv(partitions)?;
+        let csv = test::scan_partitioned_csv(partitions).await?;
 
         let predicate: Arc<dyn PhysicalExpr> = binary(
             binary(
@@ -290,7 +290,7 @@ mod tests {
     async fn with_new_children() -> Result<()> {
         let schema = test_util::aggr_test_schema();
         let partitions = 4;
-        let input = test::scan_partitioned_csv(partitions)?;
+        let input = test::scan_partitioned_csv(partitions).await?;
 
         let predicate: Arc<dyn PhysicalExpr> = binary(
             col("c2", &schema)?,

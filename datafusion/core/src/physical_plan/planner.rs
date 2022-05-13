@@ -1528,7 +1528,7 @@ fn tuple_err<T, R>(value: (Result<T>, Result<R>)) -> Result<(T, R)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
+    use crate::datasource::listing::ListingTableUrl;
     use crate::execution::context::TaskContext;
     use crate::execution::options::CsvReadOptions;
     use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
@@ -1546,6 +1546,7 @@ mod tests {
     use datafusion_expr::sum;
     use datafusion_expr::{col, lit};
     use fmt::Debug;
+    use object_store::local::LocalFileSystem;
     use std::collections::HashMap;
     use std::convert::TryFrom;
     use std::{any::Any, fmt};
@@ -1568,11 +1569,12 @@ mod tests {
     async fn test_all_operators() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let uri = ListingTableUrl::parse(path).unwrap();
 
         let options = CsvReadOptions::new().schema_infer_max_records(100);
         let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            path,
+            Arc::new(LocalFileSystem::new("/")),
+            uri,
             options,
             None,
             1,
@@ -1620,11 +1622,12 @@ mod tests {
     async fn test_with_csv_plan() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let uri = ListingTableUrl::parse(path).unwrap();
 
         let options = CsvReadOptions::new().schema_infer_max_records(100);
         let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            path,
+            Arc::new(LocalFileSystem::new("/")),
+            uri,
             options,
             None,
             1,
@@ -1646,6 +1649,7 @@ mod tests {
     async fn errors() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let uri = ListingTableUrl::parse(path).unwrap();
         let options = CsvReadOptions::new().schema_infer_max_records(100);
 
         let bool_expr = col("c1").eq(col("c1"));
@@ -1667,8 +1671,8 @@ mod tests {
         ];
         for case in cases {
             let logical_plan = LogicalPlanBuilder::scan_csv(
-                Arc::new(LocalFileSystem {}),
-                &path,
+                Arc::new(LocalFileSystem::new("/")),
+                uri.clone(),
                 options.clone(),
                 None,
                 1,
@@ -1759,6 +1763,7 @@ mod tests {
     async fn in_list_types() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let path = ListingTableUrl::parse(path).unwrap();
         let options = CsvReadOptions::new().schema_infer_max_records(100);
 
         // expression: "a in ('a', 1)"
@@ -1767,8 +1772,8 @@ mod tests {
             Expr::Literal(ScalarValue::Int64(Some(1))),
         ];
         let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
+            Arc::new(LocalFileSystem::new("/")),
+            path.clone(),
             options.clone(),
             None,
             1,
@@ -1789,8 +1794,8 @@ mod tests {
             Expr::Literal(ScalarValue::Utf8(Some("a".to_string()))),
         ];
         let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
+            Arc::new(LocalFileSystem::new("/")),
+            path.clone(),
             options.clone(),
             None,
             1,
@@ -1820,6 +1825,7 @@ mod tests {
     async fn in_set_test() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let uri = ListingTableUrl::parse(path).unwrap();
         let options = CsvReadOptions::new().schema_infer_max_records(100);
 
         // OPTIMIZER_INSET_THRESHOLD = 10
@@ -1830,8 +1836,8 @@ mod tests {
         }
 
         let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
+            Arc::new(LocalFileSystem::new("/")),
+            uri,
             options,
             None,
             1,
@@ -1850,6 +1856,7 @@ mod tests {
     async fn in_set_null_test() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let uri = ListingTableUrl::parse(path).unwrap();
         let options = CsvReadOptions::new().schema_infer_max_records(100);
         // test NULL
         let mut list = vec![Expr::Literal(ScalarValue::Int64(None))];
@@ -1858,8 +1865,8 @@ mod tests {
         }
 
         let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
+            Arc::new(LocalFileSystem::new("/")),
+            uri,
             options,
             None,
             1,
@@ -1878,11 +1885,12 @@ mod tests {
     async fn hash_agg_input_schema() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let uri = ListingTableUrl::parse(path).unwrap();
 
         let options = CsvReadOptions::new().schema_infer_max_records(100);
         let logical_plan = LogicalPlanBuilder::scan_csv_with_name(
-            Arc::new(LocalFileSystem {}),
-            &path,
+            Arc::new(LocalFileSystem::new("/")),
+            uri,
             options,
             None,
             "aggregate_test_100",
@@ -1912,11 +1920,12 @@ mod tests {
     async fn hash_agg_group_by_partitioned() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let uri = ListingTableUrl::parse(path).unwrap();
 
         let options = CsvReadOptions::new().schema_infer_max_records(100);
         let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
+            Arc::new(LocalFileSystem::new("/")),
+            uri,
             options,
             None,
             1,

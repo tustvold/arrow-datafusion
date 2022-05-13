@@ -19,13 +19,18 @@
 //! This allows the user to extend DataFusion with different storage systems such as S3 or HDFS
 //! and query data inside these systems.
 
+use crate::datasource::listing::ListingTableUrl;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_data_access::object_store::local::{LocalFileSystem, LOCAL_SCHEME};
-use datafusion_data_access::object_store::ObjectStore;
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+
+pub static LOCAL_SCHEME: &str = "file";
+
+// TODO: ObjectStoreSchema - to provide bucket mapping
 
 /// Object store registry
 pub struct ObjectStoreRegistry {
@@ -55,7 +60,10 @@ impl ObjectStoreRegistry {
     /// ['LocalFileSystem'] store is registered in by default to support read local files natively.
     pub fn new() -> Self {
         let mut map: HashMap<String, Arc<dyn ObjectStore>> = HashMap::new();
-        map.insert(LOCAL_SCHEME.to_string(), Arc::new(LocalFileSystem));
+        map.insert(
+            LOCAL_SCHEME.to_string(),
+            Arc::new(LocalFileSystem::new("/")),
+        );
 
         Self {
             object_stores: RwLock::new(map),
@@ -83,56 +91,45 @@ impl ObjectStoreRegistry {
     /// - URI with scheme `file://` or no schema will return the default LocalFS store
     /// - URI with scheme `s3://` will return the S3 store if it's registered
     /// Returns a tuple with the store and the self-described uri of the file in that store
-    pub fn get_by_uri<'a>(
-        &self,
-        uri: &'a str,
-    ) -> Result<(Arc<dyn ObjectStore>, &'a str)> {
-        if let Some((scheme, path)) = uri.split_once("://") {
-            let stores = self.object_stores.read();
-            let store = stores
-                .get(&*scheme.to_lowercase())
-                .map(Clone::clone)
-                .ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "No suitable object store found for {}",
-                        scheme
-                    ))
-                })?;
-            Ok((store, path))
-        } else {
-            Ok((Arc::new(LocalFileSystem), uri))
-        }
+    pub fn get_by_uri(&self, uri: &ListingTableUrl) -> Result<Arc<dyn ObjectStore>> {
+        let stores = self.object_stores.read();
+        let store = stores.get(uri.scheme()).map(Clone::clone).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "No suitable object store found for {}",
+                uri
+            ))
+        })?;
+
+        Ok(store)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ObjectStoreRegistry;
-    use datafusion_data_access::object_store::local::LocalFileSystem;
+    use crate::datasource::listing::ListingTableUrl;
+    use object_store::memory::InMemory;
     use std::sync::Arc;
 
     #[test]
     fn test_get_by_uri_s3() {
         let sut = ObjectStoreRegistry::default();
-        sut.register_store("s3".to_string(), Arc::new(LocalFileSystem {}));
-        let uri = "s3://bucket/key";
-        let (_, path) = sut.get_by_uri(uri).unwrap();
-        assert_eq!(path, "bucket/key");
+        sut.register_store("s3".to_string(), Arc::new(InMemory::new()));
+        let uri = ListingTableUrl::parse("s3://bucket/key").unwrap();
+        sut.get_by_uri(&uri).unwrap();
     }
 
     #[test]
     fn test_get_by_uri_file() {
         let sut = ObjectStoreRegistry::default();
-        let uri = "file:///bucket/key";
-        let (_, path) = sut.get_by_uri(uri).unwrap();
-        assert_eq!(path, "/bucket/key");
+        let uri = ListingTableUrl::parse("file:///bucket/key").unwrap();
+        sut.get_by_uri(&uri).unwrap();
     }
 
     #[test]
     fn test_get_by_uri_local() {
         let sut = ObjectStoreRegistry::default();
-        let uri = "/bucket/key";
-        let (_, path) = sut.get_by_uri(uri).unwrap();
-        assert_eq!(path, "/bucket/key");
+        let uri = ListingTableUrl::parse("../").unwrap();
+        sut.get_by_uri(&uri).unwrap();
     }
 }

@@ -814,6 +814,10 @@ fn normalize_for_explain(s: &str) -> String {
     let data_path = datafusion::test_util::arrow_test_data();
     let s = s.replace(&data_path, "ARROW_TEST_DATA");
 
+    // Also normalize if no leading `/`
+    let data_path = data_path.strip_prefix('/').unwrap();
+    let s = s.replace(&data_path, "ARROW_TEST_DATA");
+
     // convert things like partitioning=RoundRobinBatch(16)
     // to partitioning=RoundRobinBatch(NUM_CORES)
     let needle = format!("RoundRobinBatch({})", num_cpus::get());
@@ -944,7 +948,7 @@ async fn nyc() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_csv(
         "tripdata",
-        "file.csv",
+        "file:///file.csv",
         CsvReadOptions::new().schema(&schema),
     )
     .await?;

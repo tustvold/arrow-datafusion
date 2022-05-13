@@ -18,21 +18,22 @@
 //! Apache Avro format abstractions
 
 use std::any::Any;
+use std::io::BufReader;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::{self, datatypes::SchemaRef};
 use async_trait::async_trait;
-use futures::StreamExt;
 
 use super::FileFormat;
 use crate::avro_to_arrow::read_avro_schema_from_reader;
+use crate::datasource::local::fetch_to_local_file;
 use crate::error::Result;
 use crate::logical_plan::Expr;
 use crate::physical_plan::file_format::{AvroExec, FileScanConfig};
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::Statistics;
-use datafusion_data_access::object_store::{ObjectReader, ObjectReaderStream};
+use object_store::{ObjectMeta, ObjectStore};
 
 /// The default file extension of avro files
 pub const DEFAULT_AVRO_EXTENSION: &str = ".avro";
@@ -46,12 +47,18 @@ impl FileFormat for AvroFormat {
         self
     }
 
-    async fn infer_schema(&self, mut readers: ObjectReaderStream) -> Result<SchemaRef> {
+    async fn infer_schema(
+        &self,
+        store: &dyn ObjectStore,
+        files: &[ObjectMeta],
+    ) -> Result<SchemaRef> {
         let mut schemas = vec![];
-        while let Some(obj_reader) = readers.next().await {
-            let mut reader = obj_reader?.sync_reader()?;
-            let schema = read_avro_schema_from_reader(&mut reader)?;
-            schemas.push(schema);
+        for file in files {
+            // TODO: Fetching entire file just for the header is wasteful
+            let file = fetch_to_local_file(store, &file.location).await?;
+            let mut buffered = BufReader::new(file);
+            let schema = read_avro_schema_from_reader(&mut buffered)?;
+            schemas.push(schema)
         }
         let merged_schema = Schema::try_merge(schemas)?;
         Ok(Arc::new(merged_schema))
@@ -59,8 +66,9 @@ impl FileFormat for AvroFormat {
 
     async fn infer_stats(
         &self,
-        _reader: Arc<dyn ObjectReader>,
+        _store: &dyn ObjectStore,
         _table_schema: SchemaRef,
+        _file: &ObjectMeta,
     ) -> Result<Statistics> {
         Ok(Statistics::default())
     }
@@ -398,18 +406,17 @@ mod tests {
 mod tests {
     use super::*;
 
-    use crate::datafusion_data_access::object_store::local::local_object_reader_stream;
+    use super::super::test_util::get_exec_format;
     use crate::error::DataFusionError;
 
     #[tokio::test]
     async fn test() -> Result<()> {
+        let format = AvroFormat {};
         let testdata = crate::test_util::arrow_test_data();
-        let filename = format!("{}/avro/alltypes_plain.avro", testdata);
-        let schema_result = AvroFormat {}
-            .infer_schema(local_object_reader_stream(vec![filename]))
-            .await;
+        let filename = "avro/alltypes_plain.avro";
+        let result = get_exec_format(&format, &testdata, filename, None, None).await;
         assert!(matches!(
-            schema_result,
+            result,
             Err(DataFusionError::NotImplemented(msg))
             if msg == *"cannot read avro schema without the 'avro' feature enabled"
         ));

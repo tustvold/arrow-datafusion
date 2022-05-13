@@ -45,9 +45,9 @@ use crate::{
 };
 use arrow::array::{new_null_array, UInt16BufferBuilder};
 use arrow::record_batch::RecordBatchOptions;
-use datafusion_data_access::object_store::ObjectStore;
 use lazy_static::lazy_static;
 use log::info;
+use object_store::ObjectStore;
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter, Result as FmtResult},
@@ -159,15 +159,11 @@ struct FileGroupsDisplay<'a>(&'a [Vec<PartitionedFile>]);
 
 impl<'a> Display for FileGroupsDisplay<'a> {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        use itertools::Itertools;
         let parts: Vec<_> = self
             .0
             .iter()
-            .map(|pp| {
-                pp.iter()
-                    .map(|pf| pf.file_meta.path())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
+            .map(|pp| pp.iter().map(|pf| &pf.object_meta.location).join(", "))
             .collect();
         write!(f, "[{}]", parts.join(", "))
     }
@@ -400,9 +396,10 @@ fn create_dict_array(
 #[cfg(test)]
 mod tests {
     use crate::{
-        test::{build_table_i32, columns, object_store::TestObjectStore},
+        test::{build_table_i32, columns},
         test_util::aggr_test_schema,
     };
+    use object_store::memory::InMemory;
 
     use super::*;
 
@@ -657,7 +654,7 @@ mod tests {
             file_schema,
             file_groups: vec![vec![]],
             limit: None,
-            object_store: TestObjectStore::new_arc(&[]),
+            object_store: Arc::new(InMemory::new()),
             projection,
             statistics,
             table_partition_cols,

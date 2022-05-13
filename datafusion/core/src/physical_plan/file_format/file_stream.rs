@@ -21,51 +21,74 @@
 //! Note: Most traits here need to be marked `Sync + Send` to be
 //! compliant with the `SendableRecordBatchStream` trait.
 
-use crate::datasource::listing::PartitionedFile;
-use crate::{physical_plan::RecordBatchStream, scalar::ScalarValue};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use arrow::datatypes::SchemaRef;
 use arrow::{
-    datatypes::SchemaRef,
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
-use datafusion_data_access::object_store::ObjectStore;
-use futures::Stream;
-use std::{
-    io::Read,
-    iter,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use futures::future::BoxFuture;
+use futures::{ready, FutureExt, Stream};
+use object_store::{ObjectMeta, ObjectStore};
 
-use super::PartitionColumnProjector;
+use datafusion_common::ScalarValue;
 
-pub type FileIter = Box<dyn Iterator<Item = PartitionedFile> + Send + Sync>;
-pub type BatchIter = Box<dyn Iterator<Item = ArrowResult<RecordBatch>> + Send + Sync>;
+use crate::datasource::listing::{FileRange, PartitionedFile};
+use crate::datasource::local::fetch_to_local_file;
+use crate::physical_plan::file_format::{FileScanConfig, PartitionColumnProjector};
+use crate::physical_plan::RecordBatchStream;
 
-/// A closure that creates a file format reader (iterator over `RecordBatch`) from a `Read` object
-/// and an optional number of required records.
-pub trait FormatReaderOpener:
-    FnMut(Box<dyn Read + Send + Sync>, &Option<usize>) -> BatchIter + Send + Unpin + 'static
-{
+pub trait FormatReaderOpener: Unpin {
+    type Reader: Iterator<Item = ArrowResult<RecordBatch>> + Send + Unpin;
+
+    type File: Unpin;
+
+    fn fetch(
+        &mut self,
+        store: Arc<dyn ObjectStore>,
+        file: ObjectMeta,
+        range: Option<FileRange>,
+    ) -> BoxFuture<'static, ArrowResult<Self::File>>;
+
+    fn reader(&mut self, file: Self::File) -> ArrowResult<Self::Reader>;
 }
 
-impl<T> FormatReaderOpener for T where
-    T: FnMut(Box<dyn Read + Send + Sync>, &Option<usize>) -> BatchIter
-        + Send
-        + Unpin
-        + 'static
+impl<T, R> FormatReaderOpener for T
+where
+    T: FnMut(File) -> ArrowResult<R> + Unpin,
+    R: Iterator<Item = ArrowResult<RecordBatch>> + Send + Unpin,
 {
+    type Reader = R;
+
+    type File = File;
+
+    fn fetch(
+        &mut self,
+        store: Arc<dyn ObjectStore>,
+        file: ObjectMeta,
+        _range: Option<FileRange>,
+    ) -> BoxFuture<'static, ArrowResult<Self::File>> {
+        Box::pin(async move {
+            fetch_to_local_file(store.as_ref(), &file.location)
+                .await
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+        })
+    }
+
+    fn reader(&mut self, file: File) -> ArrowResult<Self::Reader> {
+        self(file)
+    }
 }
 
 /// A stream that iterates record batch by record batch, file over file.
 pub struct FileStream<F: FormatReaderOpener> {
-    /// An iterator over record batches of the last file returned by file_iter
-    batch_iter: BatchIter,
-    /// Partitioning column values for the current batch_iter
-    partition_values: Vec<ScalarValue>,
     /// An iterator over input files.
-    file_iter: FileIter,
+    file_iter: VecDeque<PartitionedFile>,
     /// The stream schema (file schema including partition columns and after
     /// projection).
     projected_schema: SchemaRef,
@@ -80,57 +103,119 @@ pub struct FileStream<F: FormatReaderOpener> {
     pc_projector: PartitionColumnProjector,
     /// the store from which to source the files.
     object_store: Arc<dyn ObjectStore>,
+    /// The stream state
+    state: FileStreamState<F>,
+}
+
+enum FileStreamState<F: FormatReaderOpener> {
+    Idle,
+    Fetch {
+        future: BoxFuture<'static, ArrowResult<F::File>>,
+        partition_values: Vec<ScalarValue>,
+    },
+    Scan {
+        /// Partitioning column values for the current batch_iter
+        partition_values: Vec<ScalarValue>,
+        /// The reader instance
+        reader: F::Reader,
+    },
+    Error,
+    Limit,
 }
 
 impl<F: FormatReaderOpener> FileStream<F> {
-    pub fn new(
-        object_store: Arc<dyn ObjectStore>,
-        files: Vec<PartitionedFile>,
-        file_reader: F,
-        projected_schema: SchemaRef,
-        limit: Option<usize>,
-        table_partition_cols: Vec<String>,
-    ) -> Self {
-        let pc_projector = PartitionColumnProjector::new(
-            Arc::clone(&projected_schema),
-            &table_partition_cols,
-        );
+    pub fn new(config: &FileScanConfig, partition: usize, file_reader: F) -> Self {
+        let (projected_schema, _) = config.project();
+        let pc_projector =
+            PartitionColumnProjector::new(projected_schema, &config.table_partition_cols);
+
+        let files = config.file_groups[partition].clone();
 
         Self {
-            file_iter: Box::new(files.into_iter()),
-            batch_iter: Box::new(iter::empty()),
-            partition_values: vec![],
-            remain: limit,
-            projected_schema,
+            file_iter: files.into(),
+            projected_schema: config.file_schema.clone(),
+            remain: config.limit,
             file_reader,
             pc_projector,
-            object_store,
+            object_store: config.object_store.clone(),
+            state: FileStreamState::Idle,
         }
     }
 
-    /// Acts as a flat_map of record batches over files. Adds the partitioning
-    /// Columns to the returned record batches.
-    fn next_batch(&mut self) -> Option<ArrowResult<RecordBatch>> {
-        match self.batch_iter.next() {
-            Some(Ok(batch)) => {
-                Some(self.pc_projector.project(batch, &self.partition_values))
-            }
-            Some(Err(e)) => Some(Err(e)),
-            None => match self.file_iter.next() {
-                Some(f) => {
-                    self.partition_values = f.partition_values;
-                    self.object_store
-                        .file_reader(f.file_meta.sized_file)
-                        .and_then(|r| r.sync_reader())
-                        .map_err(|e| ArrowError::ExternalError(Box::new(e)))
-                        .and_then(|f| {
-                            self.batch_iter = (self.file_reader)(f, &self.remain);
-                            self.next_batch().transpose()
-                        })
-                        .transpose()
+    fn poll_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<ArrowResult<RecordBatch>>> {
+        loop {
+            match &mut self.state {
+                FileStreamState::Idle => {
+                    let file = match self.file_iter.pop_front() {
+                        Some(file) => file,
+                        None => return Poll::Ready(None),
+                    };
+
+                    let future = self.file_reader.fetch(
+                        self.object_store.clone(),
+                        file.object_meta,
+                        file.range,
+                    );
+
+                    self.state = FileStreamState::Fetch {
+                        future,
+                        partition_values: file.partition_values,
+                    }
                 }
-                None => None,
-            },
+                FileStreamState::Fetch {
+                    future,
+                    partition_values,
+                } => match ready!(future.poll_unpin(cx))
+                    .and_then(|file| self.file_reader.reader(file))
+                {
+                    Ok(reader) => {
+                        self.state = FileStreamState::Scan {
+                            partition_values: std::mem::take(partition_values),
+                            reader,
+                        };
+                    }
+                    Err(e) => {
+                        self.state = FileStreamState::Error;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
+                FileStreamState::Scan {
+                    reader,
+                    partition_values,
+                } => match reader.next() {
+                    Some(result) => {
+                        let result = result
+                            .and_then(|b| self.pc_projector.project(b, partition_values))
+                            .map(|batch| match &mut self.remain {
+                                Some(remain) => {
+                                    if *remain > batch.num_rows() {
+                                        *remain -= batch.num_rows();
+                                        batch
+                                    } else {
+                                        let batch = batch.slice(0, *remain);
+                                        self.state = FileStreamState::Limit;
+                                        *remain = 0;
+                                        batch
+                                    }
+                                }
+                                None => batch,
+                            });
+
+                        if result.is_err() {
+                            self.state = FileStreamState::Error
+                        }
+
+                        return Poll::Ready(Some(result));
+                    }
+                    None => self.state = FileStreamState::Idle,
+                },
+                FileStreamState::Error | FileStreamState::Limit => {
+                    return Poll::Ready(None)
+                }
+            }
         }
     }
 }
@@ -140,44 +225,15 @@ impl<F: FormatReaderOpener> Stream for FileStream<F> {
 
     fn poll_next(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        // check if finished or no limit
-        match self.remain {
-            Some(r) if r == 0 => return Poll::Ready(None),
-            None => return Poll::Ready(self.get_mut().next_batch()),
-            Some(r) => r,
-        };
-
-        Poll::Ready(match self.as_mut().next_batch() {
-            Some(Ok(item)) => {
-                if let Some(remain) = self.remain.as_mut() {
-                    if *remain >= item.num_rows() {
-                        *remain -= item.num_rows();
-                        Some(Ok(item))
-                    } else {
-                        let len = *remain;
-                        *remain = 0;
-                        Some(Ok(RecordBatch::try_new(
-                            item.schema(),
-                            item.columns()
-                                .iter()
-                                .map(|column| column.slice(0, len))
-                                .collect(),
-                        )?))
-                    }
-                } else {
-                    Some(Ok(item))
-                }
-            }
-            other => other,
-        })
+        self.poll_inner(cx)
     }
 }
 
 impl<F: FormatReaderOpener> RecordBatchStream for FileStream<F> {
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.projected_schema)
+        self.projected_schema.clone()
     }
 }
 
@@ -185,36 +241,39 @@ impl<F: FormatReaderOpener> RecordBatchStream for FileStream<F> {
 mod tests {
     use futures::StreamExt;
 
-    use super::*;
+    use crate::datasource::listing::PartitionedFile;
     use crate::{
-        error::Result,
-        test::{make_partition, object_store::TestObjectStore},
+        error::Result, test::make_partition, test::object_store::make_in_memory_store,
     };
+
+    use super::*;
 
     /// helper that creates a stream of 2 files with the same pair of batches in each ([0,1,2] and [0,1])
     async fn create_and_collect(limit: Option<usize>) -> Vec<RecordBatch> {
         let records = vec![make_partition(3), make_partition(2)];
+        let file_schema = records[0].schema();
 
-        let source_schema = records[0].schema();
-
-        let reader = move |_file, _remain: &Option<usize>| {
+        let reader = move |_file| {
             // this reader returns the same batch regardless of the file
-            Box::new(records.clone().into_iter().map(Ok)) as BatchIter
+            Ok(records.clone().into_iter().map(Ok))
         };
 
-        let file_stream = FileStream::new(
-            TestObjectStore::new_arc(&[("mock_file1", 10), ("mock_file2", 20)]),
-            vec![
+        let object_store = make_in_memory_store([("mock_file1", 10), ("mock_file2", 20)]);
+
+        let config = FileScanConfig {
+            object_store,
+            file_schema,
+            file_groups: vec![vec![
                 PartitionedFile::new("mock_file1".to_owned(), 10),
                 PartitionedFile::new("mock_file2".to_owned(), 20),
-            ],
-            reader,
-            source_schema,
+            ]],
+            statistics: Default::default(),
+            projection: None,
             limit,
-            vec![],
-        );
+            table_partition_cols: vec![],
+        };
 
-        file_stream
+        FileStream::new(&config, 0, reader)
             .map(|b| b.expect("No error expected in stream"))
             .collect::<Vec<_>>()
             .await

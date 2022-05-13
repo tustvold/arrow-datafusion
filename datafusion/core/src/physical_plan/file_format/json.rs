@@ -22,6 +22,7 @@ use crate::error::{DataFusionError, Result};
 use crate::execution::context::SessionState;
 use crate::execution::context::TaskContext;
 use crate::physical_plan::expressions::PhysicalSortExpr;
+use crate::physical_plan::file_format::file_stream::FileStream;
 use crate::physical_plan::{
     DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
 };
@@ -33,7 +34,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::task::{self, JoinHandle};
 
-use super::file_stream::{BatchIter, FileStream};
 use super::FileScanConfig;
 
 /// Execution plan for scanning NdJson data source
@@ -99,31 +99,23 @@ impl ExecutionPlan for NdJsonExec {
         let batch_size = context.session_config().batch_size;
         let file_schema = Arc::clone(&self.base_config.file_schema);
 
-        // The json reader cannot limit the number of records, so `remaining` is ignored.
-        let fun = move |file, _remaining: &Option<usize>| {
-            // TODO: make DecoderOptions implement Clone so we can
-            // clone here rather than recreating the options each time
-            // https://github.com/apache/arrow-rs/issues/1580
-            let options = DecoderOptions::new().with_batch_size(batch_size);
-
-            let options = if let Some(proj) = proj.clone() {
-                options.with_projection(proj)
-            } else {
-                options
-            };
-
-            Box::new(json::Reader::new(file, Arc::clone(&file_schema), options))
-                as BatchIter
+        let options = DecoderOptions::new().with_batch_size(batch_size);
+        let options = if let Some(proj) = proj.clone() {
+            options.with_projection(proj)
+        } else {
+            options
         };
 
-        Ok(Box::pin(FileStream::new(
-            Arc::clone(&self.base_config.object_store),
-            self.base_config.file_groups[partition].clone(),
-            fun,
-            Arc::clone(&self.projected_schema),
-            self.base_config.limit,
-            self.base_config.table_partition_cols.clone(),
-        )))
+        // The json reader cannot limit the number of records, so `remaining` is ignored.
+        let fun = move |file| {
+            Ok(json::Reader::new(
+                file,
+                Arc::clone(&file_schema),
+                options.clone(),
+            ))
+        };
+
+        Ok(Box::pin(FileStream::new(&self.base_config, partition, fun)))
     }
 
     fn fmt_as(
@@ -191,14 +183,11 @@ mod tests {
     use arrow::array::Array;
     use arrow::datatypes::{Field, Schema};
     use futures::StreamExt;
+    use object_store::local::LocalFileSystem;
+    use object_store::{ObjectMeta, ObjectStore};
 
-    use crate::datafusion_data_access::object_store::local::{
-        local_object_reader_stream, LocalFileSystem,
-    };
-    use crate::datasource::{
-        file_format::{json::JsonFormat, FileFormat},
-        listing::local_unpartitioned_file,
-    };
+    use crate::datasource::file_format::{json::JsonFormat, FileFormat};
+    use crate::datasource::listing::PartitionedFile;
     use crate::prelude::NdJsonReadOptions;
     use crate::prelude::*;
     use tempfile::TempDir;
@@ -207,10 +196,24 @@ mod tests {
 
     const TEST_DATA_BASE: &str = "tests/jsons";
 
-    async fn infer_schema(path: String) -> Result<SchemaRef> {
-        JsonFormat::default()
-            .infer_schema(local_object_reader_stream(vec![path]))
+    async fn prepare_store(
+    ) -> (Arc<dyn ObjectStore>, Vec<Vec<PartitionedFile>>, SchemaRef) {
+        let store = Arc::new(LocalFileSystem::new(TEST_DATA_BASE));
+        let path = object_store::path::Path::from_raw("1.json");
+        let object_meta = store.head(&path).await.unwrap();
+        let schema = JsonFormat::default()
+            .infer_schema(
+                store.as_ref(),
+                &[ObjectMeta {
+                    location: object_meta.location.clone(),
+                    last_modified: object_meta.last_modified,
+                    size: object_meta.size,
+                }],
+            )
             .await
+            .unwrap();
+
+        (store, vec![vec![object_meta.into()]], schema)
     }
 
     #[tokio::test]
@@ -218,11 +221,12 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         use arrow::datatypes::DataType;
-        let path = format!("{}/1.json", TEST_DATA_BASE);
+        let (object_store, file_groups, file_schema) = prepare_store().await;
+
         let exec = NdJsonExec::new(FileScanConfig {
-            object_store: Arc::new(LocalFileSystem {}),
-            file_groups: vec![vec![local_unpartitioned_file(path.clone())]],
-            file_schema: infer_schema(path).await?,
+            object_store,
+            file_groups,
+            file_schema,
             statistics: Statistics::default(),
             projection: None,
             limit: Some(3),
@@ -274,9 +278,7 @@ mod tests {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
         use arrow::datatypes::DataType;
-        let path = format!("{}/1.json", TEST_DATA_BASE);
-
-        let actual_schema = infer_schema(path.clone()).await?;
+        let (object_store, file_groups, actual_schema) = prepare_store().await;
 
         let mut fields = actual_schema.fields().clone();
         fields.push(Field::new("missing_col", DataType::Int32, true));
@@ -285,8 +287,8 @@ mod tests {
         let file_schema = Arc::new(Schema::new(fields));
 
         let exec = NdJsonExec::new(FileScanConfig {
-            object_store: Arc::new(LocalFileSystem {}),
-            file_groups: vec![vec![local_unpartitioned_file(path.clone())]],
+            object_store,
+            file_groups,
             file_schema,
             statistics: Statistics::default(),
             projection: None,
@@ -315,11 +317,12 @@ mod tests {
     async fn nd_json_exec_file_projection() -> Result<()> {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let path = format!("{}/1.json", TEST_DATA_BASE);
+        let (object_store, file_groups, file_schema) = prepare_store().await;
+
         let exec = NdJsonExec::new(FileScanConfig {
-            object_store: Arc::new(LocalFileSystem {}),
-            file_groups: vec![vec![local_unpartitioned_file(path.clone())]],
-            file_schema: infer_schema(path).await?,
+            object_store,
+            file_groups,
+            file_schema,
             statistics: Statistics::default(),
             projection: Some(vec![0, 2]),
             limit: None,
@@ -355,10 +358,13 @@ mod tests {
         let ctx =
             SessionContext::with_config(SessionConfig::new().with_target_partitions(8));
 
-        let path = format!("{}/1.json", TEST_DATA_BASE);
+        ctx.runtime_env().register_object_store(
+            "test",
+            Arc::new(LocalFileSystem::new(TEST_DATA_BASE)),
+        );
 
         // register json file with the execution context
-        ctx.register_json("test", path.as_str(), NdJsonReadOptions::default())
+        ctx.register_json("test", "test://1.json", NdJsonReadOptions::default())
             .await?;
 
         // execute a simple query and write the results to CSV
