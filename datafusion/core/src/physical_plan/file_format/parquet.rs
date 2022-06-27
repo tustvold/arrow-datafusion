@@ -51,6 +51,8 @@ use crate::datasource::listing::FileRange;
 use crate::physical_plan::file_format::file_stream::{
     FileStream, FormatReader, ReaderFuture,
 };
+use crate::physical_plan::stream::RecordBatchReceiverStream;
+use crate::physical_plan::RecordBatchStream;
 use crate::{
     error::{DataFusionError, Result},
     execution::context::{SessionState, TaskContext},
@@ -215,10 +217,21 @@ impl ExecutionPlan for ParquetExec {
             metrics: self.metrics.clone(),
         };
 
-        let stream =
+        let mut stream =
             FileStream::new(&self.base_config, partition_index, context, opener)?;
 
-        Ok(Box::pin(stream))
+        let schema = stream.schema();
+        let (sender, receiver) = tokio::sync::mpsc::channel(10);
+        let task = tokio::task::spawn(async move {
+            while let Some(res) = stream.next().await {
+                if sender.send(res).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stream = RecordBatchReceiverStream::create(&schema, receiver, task);
+        Ok(stream)
     }
 
     fn fmt_as(
