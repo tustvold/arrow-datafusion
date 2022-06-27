@@ -147,9 +147,9 @@ impl PipelinePlanner {
         //
         // TODO: More sophisticated policy, just because we can combine them doesn't mean we should
         match self.execution_operators.as_mut() {
-            Some(buffer) => {
-                assert_eq!(parent, buffer.output, "QueryBuilder out of sync");
-                buffer.depth += 1;
+            Some(group) => {
+                assert_eq!(parent, group.output, "QueryBuilder out of sync");
+                group.depth += 1;
             }
             None => {
                 self.execution_operators = Some(OperatorGroup {
@@ -160,19 +160,25 @@ impl PipelinePlanner {
             }
         }
 
-        match children.len() {
-            1 => {
-                // Enqueue the children with the parent of the `OperatorGroup`
-                self.to_visit
-                    .push((children.into_iter().next().unwrap(), parent))
-            }
-            _ => {
-                // We can only recursively group through nodes with a single child, therefore
-                // if this node has multiple children, we now need to flush the buffer and
-                // enqueue its children with this new pipeline as its parent
-                let node = self.flush_exec()?;
-                self.enqueue_children(children, node);
-            }
+        // We can only recursively group through nodes with a single child, therefore
+        // if this node has multiple children, we now need to flush the buffer and
+        // enqueue its children with this new pipeline as its parent
+        let has_single_child = children.len() == 1;
+
+        // Input nodes are often a bottleneck for query execution, especially for formats such as
+        // parquet or JSON where the decoding logic is non-trivial. As a result we schedule
+        // such operators as a single OperatorGroup to permit them to run in parallel
+        // with respect to the rest of the query execution
+        let is_input_operator = parent.is_none();
+
+        if has_single_child && !is_input_operator {
+            // Enqueue the children with the parent of the `OperatorGroup`
+            self.to_visit
+                .push((children.into_iter().next().unwrap(), parent))
+        } else {
+            // Flush the current OperatorGroup and enqueue its children
+            let node = self.flush_exec()?;
+            self.enqueue_children(children, node);
         }
 
         Ok(())

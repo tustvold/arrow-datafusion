@@ -220,13 +220,16 @@ fn spawn_local_fifo(task: Task) {
     rayon::spawn_fifo(|| task.do_work())
 }
 
+/// A [`Spawner`] is a Clone-able type that can be used to spawn [`Task`]
+/// to a particular [`Scheduler`]
 #[derive(Debug, Clone)]
-pub struct Spawner {
+struct Spawner {
     pool: Arc<ThreadPool>,
 }
 
 impl Spawner {
-    pub fn spawn(&self, task: Task) {
+    /// Spawn the provided [`Task`] to the associated [`Scheduler`]
+    fn spawn(&self, task: Task) {
         debug!("Spawning {:?} to any worker", task);
         self.pool.spawn(move || task.do_work());
     }
