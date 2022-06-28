@@ -1271,7 +1271,7 @@ impl ScalarValue {
         if array.is_null(index) {
             ScalarValue::Decimal128(None, *precision, *scale)
         } else {
-            ScalarValue::Decimal128(Some(array.value(index)), *precision, *scale)
+            ScalarValue::Decimal128(Some(array.value(index).as_i128()), *precision, *scale)
         }
     }
 
@@ -1446,7 +1446,7 @@ impl ScalarValue {
         }
         match value {
             None => array.is_null(index),
-            Some(v) => !array.is_null(index) && array.value(index) == *v,
+            Some(v) => !array.is_null(index) && array.value(index).as_i128() == *v,
         }
     }
 

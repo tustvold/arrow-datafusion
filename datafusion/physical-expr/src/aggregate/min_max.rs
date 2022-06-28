@@ -178,9 +178,9 @@ macro_rules! typed_min_max_batch_decimal128 {
             let array = $VALUES.as_any().downcast_ref::<DecimalArray>().unwrap();
             if null_count == 0 {
                 // there is no null value
-                let mut result = array.value(0);
+                let mut result = array.value(0).as_i128();
                 for i in 1..array.len() {
-                    result = result.$OP(array.value(i));
+                    result = result.$OP(array.value(i).as_i128());
                 }
                 ScalarValue::Decimal128(Some(result), *$PRECISION, *$SCALE)
             } else {
@@ -189,10 +189,10 @@ macro_rules! typed_min_max_batch_decimal128 {
                 for i in 0..array.len() {
                     if !has_value && array.is_valid(i) {
                         has_value = true;
-                        result = array.value(i);
+                        result = array.value(i).as_i128();
                     }
                     if array.is_valid(i) {
-                        result = result.$OP(array.value(i));
+                        result = result.$OP(array.value(i).as_i128());
                     }
                 }
                 ScalarValue::Decimal128(Some(result), *$PRECISION, *$SCALE)
