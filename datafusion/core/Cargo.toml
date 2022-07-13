@@ -99,6 +99,7 @@ doc-comment = "0.3"
 env_logger = "0.9"
 fuzz-utils = { path = "fuzz-utils" }
 serde_json = "1.0"
+csv = "1.1.6"
 
 [[bench]]
 harness = false

@@ -21,6 +21,7 @@ use datafusion::{
     physical_plan::collect_partitioned,
 };
 use tempfile::TempDir;
+use datafusion_proto::bytes::logical_plan_to_json;
 
 #[tokio::test]
 async fn all_where_empty() -> Result<()> {
@@ -244,6 +245,30 @@ async fn select_values_list() -> Result<()> {
         ];
         assert_batches_eq!(expected, &actual);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn select_inline_csv() -> Result<()> {
+
+    let region_data = r#"24,UNITED STATES,1,
+    23,UNITED KINGDOM,2,"#;
+
+    let ctx = SessionContext::new();
+    register_tpch_csv_data(&ctx, "nation", &region_data).await?;
+
+    let sql = "SELECT * FROM nation";
+    let plan = ctx.create_logical_plan(sql).unwrap();
+    let json = logical_plan_to_json(&plan)?;
+    let expected = "{good looking json here}";
+    assert_eq!(json, expected);
+
+    let results = execute_to_batches(&ctx, sql).await;
+
+    // let expected = vec![];
+
+    // assert_batches_eq!(expected, &results);
+
     Ok(())
 }
 

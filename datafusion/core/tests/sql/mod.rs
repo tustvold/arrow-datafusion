@@ -18,10 +18,7 @@
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-use arrow::{
-    array::*, datatypes::*, record_batch::RecordBatch,
-    util::display::array_value_to_string,
-};
+use arrow::{array::*, datatypes::*, record_batch::RecordBatch, util::display::array_value_to_string};
 use chrono::prelude::*;
 use chrono::Duration;
 
@@ -48,9 +45,11 @@ use datafusion::{execution::context::SessionContext, physical_plan::displayable}
 use datafusion_expr::Volatility;
 use object_store::path::Path;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Write};
 use std::path::PathBuf;
+use csv::Trim;
 use tempfile::TempDir;
+use datafusion::physical_plan::memory::MemoryExec;
 
 /// A macro to assert that some particular line contains two substrings
 ///
@@ -496,6 +495,58 @@ async fn register_tpch_csv(ctx: &SessionContext, table: &str) -> Result<()> {
         CsvReadOptions::new().schema(&schema),
     )
     .await?;
+    Ok(())
+}
+
+async fn register_tpch_csv_data(ctx: &SessionContext, table_name: &str, data: &str) -> Result<()> {
+    let schema = Arc::new(get_tpch_table_schema(table_name));
+
+    let mut reader = ::csv::ReaderBuilder::new().has_headers(false)
+        .from_reader(data.as_bytes());
+    let records: Vec<_> = reader.records().map(|it| it.unwrap()).collect();
+
+    let mut cols: Vec<Box<dyn ArrayBuilder>> = vec![];
+    for field in schema.fields().iter() {
+        match field.data_type() {
+            DataType::Utf8 => cols.push(Box::new(StringBuilder::new(records.len()))),
+            DataType::Int64 => cols.push(Box::new(Int64Builder::new(records.len()))),
+            _ => {
+                let msg = format!("Not implemented: {}", field.data_type());
+                Err(DataFusionError::Plan(msg))?
+            }
+        }
+    }
+
+    for record in records.iter() {
+        for (idx, val) in record.iter().enumerate() {
+            let mut col = cols.get_mut(idx).unwrap();
+            let field = schema.field(idx);
+            match field.data_type() {
+                DataType::Utf8 => {
+                    let sb = col.as_any_mut().downcast_mut::<StringBuilder>().unwrap();
+                    sb.append_value(val).unwrap();
+                },
+                DataType::Int64 => {
+                    let sb = col.as_any_mut().downcast_mut::<Int64Builder>().unwrap();
+                    sb.append_value(val.trim().parse().unwrap()).unwrap();
+                }
+                _ => Err(DataFusionError::Plan(format!("Not implemented: {}", field.data_type())))?
+            }
+        }
+    }
+    let cols: Vec<ArrayRef> = cols.iter_mut().map(|it| it.finish()).collect();
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        cols,
+    )?;
+
+    let table = Arc::new(MemTable::try_new(
+        Arc::clone(&schema),
+        vec![vec![batch]],
+    )?);
+    let _ = ctx.register_table(table_name, table).unwrap();
+    
     Ok(())
 }
 
