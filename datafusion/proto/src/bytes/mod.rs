@@ -107,6 +107,18 @@ pub fn logical_plan_to_bytes(plan: &LogicalPlan) -> Result<Bytes> {
     logical_plan_to_bytes_with_extension_codec(plan, &extension_codec)
 }
 
+#[cfg(feature = "serde")]
+pub fn logical_plan_to_json(plan: &LogicalPlan) -> Result<String> {
+    let extension_codec = DefaultExtensionCodec {};
+    let protobuf =
+        protobuf::LogicalPlanNode::try_from_logical_plan(&plan, &extension_codec).map_err(|e| {
+            DataFusionError::Plan(format!("Error serializing plan: {}", e))
+        })?;
+    serde_json::to_string(&protobuf).map_err(|e| {
+        DataFusionError::Plan(format!("Error serializing plan: {}", e))
+    })
+}
+
 /// Serialize a LogicalPlan as bytes, using the provided extension codec
 pub fn logical_plan_to_bytes_with_extension_codec(
     plan: &LogicalPlan,

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_proto::bytes::logical_plan_to_json;
 use super::*;
 use fuzz_utils::{batches_to_vec, partitions_to_sorted_vec};
 
@@ -25,6 +26,12 @@ async fn test_sort_unprojected_col() -> Result<()> {
     // execute the query
     let sql = "SELECT id FROM alltypes_plain ORDER BY int_col, double_col";
     let actual = execute_to_batches(&ctx, sql).await;
+
+    let plan = ctx.create_logical_plan(sql).unwrap();
+    let json = logical_plan_to_json(&plan)?;
+    let expected = "{good looking json here}";
+    assert_eq!(json, expected);
+
     #[rustfmt::skip]
     let expected = vec![
         "+----+",
