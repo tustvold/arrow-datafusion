@@ -265,9 +265,16 @@ async fn select_inline_csv() -> Result<()> {
 
     let results = execute_to_batches(&ctx, sql).await;
 
-    // let expected = vec![];
+    let expected = vec![
+        "+-------------+----------------+-------------+-----------+",
+        "| n_nationkey | n_name         | n_regionkey | n_comment |",
+        "+-------------+----------------+-------------+-----------+",
+        "| 24          | UNITED STATES  | 1           |           |",
+        "| 23          | UNITED KINGDOM | 2           |           |",
+        "+-------------+----------------+-------------+-----------+",
+    ];
 
-    // assert_batches_eq!(expected, &results);
+    assert_batches_eq!(expected, &results);
 
     Ok(())
 }

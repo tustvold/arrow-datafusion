@@ -47,9 +47,7 @@ use object_store::path::Path;
 use std::fs::File;
 use std::io::{Write};
 use std::path::PathBuf;
-use csv::Trim;
 use tempfile::TempDir;
-use datafusion::physical_plan::memory::MemoryExec;
 
 /// A macro to assert that some particular line contains two substrings
 ///
@@ -519,7 +517,7 @@ async fn register_tpch_csv_data(ctx: &SessionContext, table_name: &str, data: &s
 
     for record in records.iter() {
         for (idx, val) in record.iter().enumerate() {
-            let mut col = cols.get_mut(idx).unwrap();
+            let col = cols.get_mut(idx).unwrap();
             let field = schema.field(idx);
             match field.data_type() {
                 DataType::Utf8 => {
