@@ -21,7 +21,6 @@ use crate::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MemTrackingMetrics, MetricsSet,
 };
 use log::debug;
-use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::{BinaryHeap, VecDeque};
 use std::pin::Pin;
@@ -258,7 +257,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
 
 struct MergingStreams {
     /// The sorted input streams to merge together
-    streams: Mutex<Vec<Fuse<SendableRecordBatchStream>>>,
+    streams: Vec<Fuse<SendableRecordBatchStream>>,
     /// number of streams
     num_streams: usize,
 }
@@ -275,7 +274,7 @@ impl MergingStreams {
     fn new(input_streams: Vec<Fuse<SendableRecordBatchStream>>) -> Self {
         Self {
             num_streams: input_streams.len(),
-            streams: Mutex::new(input_streams),
+            streams: input_streams,
         }
     }
 
@@ -373,9 +372,7 @@ impl SortPreservingMergeStream {
         }
         let mut empty_batch = false;
         {
-            let mut streams = self.streams.streams.lock();
-
-            let stream = &mut streams[idx];
+            let stream = &mut self.streams.streams[idx];
             if stream.is_terminated() {
                 return Poll::Ready(Ok(()));
             }
@@ -543,12 +540,12 @@ impl SortPreservingMergeStream {
             }
         }
 
-        loop {
-            // NB timer records time taken on drop, so there are no
-            // calls to `timer.done()` below.
-            let elapsed_compute = self.tracking_metrics.elapsed_compute().clone();
-            let _timer = elapsed_compute.timer();
+        // NB timer records time taken on drop, so there are no
+        // calls to `timer.done()` below.
+        let elapsed_compute = self.tracking_metrics.elapsed_compute().clone();
+        let _timer = elapsed_compute.timer();
 
+        loop {
             match self.min_heap.pop() {
                 Some(mut cursor) => {
                     let stream_idx = cursor.stream_idx();
