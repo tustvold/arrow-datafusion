@@ -34,3 +34,10 @@ exclude = ["datafusion-cli"]
 [profile.release]
 codegen-units = 1
 lto = true
+
+[patch.crates-io]
+arrow = { git = "https://github.com/tustvold/arrow-rs.git", rev = "6f62bb62f630cbd910ae5b1b04f97688af7c1b42" }
+parquet = { git = "https://github.com/tustvold/arrow-rs.git", rev = "6f62bb62f630cbd910ae5b1b04f97688af7c1b42" }
+arrow-buffer = { git = "https://github.com/tustvold/arrow-rs.git", rev = "6f62bb62f630cbd910ae5b1b04f97688af7c1b42" }
+arrow-schema = { git = "https://github.com/tustvold/arrow-rs.git", rev = "6f62bb62f630cbd910ae5b1b04f97688af7c1b42" }
+arrow-flight = { git = "https://github.com/tustvold/arrow-rs.git", rev = "6f62bb62f630cbd910ae5b1b04f97688af7c1b42" }
