@@ -1351,6 +1351,7 @@ impl SessionConfig {
     /// ```
     ///
     /// [^1]: Compare that to [`ConfigOptions`] which only supports [`ScalarValue`] payloads.
+    #[deprecated(note = "Use ConfigOptions::extensions")]
     pub fn with_extension<T>(mut self, ext: Arc<T>) -> Self
     where
         T: Send + Sync + 'static,
@@ -1364,6 +1365,7 @@ impl SessionConfig {
     /// Get extension, if any for the specified type `T` exists.
     ///
     /// See [`with_extension`](Self::with_extension) on how to add attach extensions.
+    #[deprecated(note = "Use ConfigOptions::extensions")]
     pub fn get_extension<T>(&self) -> Option<Arc<T>>
     where
         T: Send + Sync + 'static,
