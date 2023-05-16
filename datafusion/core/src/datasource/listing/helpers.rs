@@ -351,6 +351,8 @@ pub async fn pruned_partition_list<'a>(
                 }
             };
 
+            info!("{files:?}");
+
             let files = files.into_iter().filter(move |o| {
                 let extension_match = o.location.as_ref().ends_with(file_extension);
                 let glob_match = table_path.contains(&o.location);
