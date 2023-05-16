@@ -21,6 +21,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use glob::Pattern;
 use itertools::Itertools;
+use log::info;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
 use percent_encoding;
@@ -177,6 +178,8 @@ impl ListingTableUrl {
                 let path = &meta.location;
                 let extension_match = path.as_ref().ends_with(file_extension);
                 let glob_match = self.contains(path);
+                info!("{path:?} {extension_match} {glob_match}");
+
                 futures::future::ready(extension_match && glob_match)
             })
             .boxed()
