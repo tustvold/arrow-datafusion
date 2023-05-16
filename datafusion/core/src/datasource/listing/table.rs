@@ -29,6 +29,7 @@ use datafusion_expr::expr::Sort;
 use datafusion_optimizer::utils::conjunction;
 use datafusion_physical_expr::{create_physical_expr, PhysicalSortExpr};
 use futures::{future, stream, StreamExt, TryStreamExt};
+use log::info;
 use object_store::path::Path;
 use object_store::ObjectMeta;
 
@@ -433,12 +434,16 @@ impl ListingOptions {
         state: &SessionState,
         table_path: &'a ListingTableUrl,
     ) -> Result<SchemaRef> {
+        info!("Inferring schema for {table_path:?}");
+
         let store = state.runtime_env().object_store(table_path)?;
 
         let files: Vec<_> = table_path
             .list_all_files(store.as_ref(), &self.file_extension)
             .try_collect()
             .await?;
+
+        info!("Found {} files", files.len());
 
         self.format.infer_schema(state, &store, &files).await
     }

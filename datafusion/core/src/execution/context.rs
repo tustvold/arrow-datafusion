@@ -91,6 +91,7 @@ use datafusion_sql::{
     parser::DFParser,
     planner::{ContextProvider, SqlToRel},
 };
+use log::info;
 use parquet::file::properties::WriterProperties;
 use sqlparser::dialect::{
     AnsiDialect, BigQueryDialect, ClickHouseDialect, Dialect, GenericDialect,
@@ -933,6 +934,7 @@ impl SessionContext {
         provided_schema: Option<SchemaRef>,
         sql_definition: Option<String>,
     ) -> Result<()> {
+        info!("Registering ListingTable with {provided_schema:?} and {options:?}");
         let table_path = ListingTableUrl::parse(table_path)?;
         let resolved_schema = match (provided_schema, options.infinite_source) {
             (Some(s), _) => s,

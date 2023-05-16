@@ -27,6 +27,7 @@ use bytes::{BufMut, BytesMut};
 use datafusion_common::DataFusionError;
 use datafusion_physical_expr::PhysicalExpr;
 use hashbrown::HashMap;
+use log::info;
 use object_store::{ObjectMeta, ObjectStore};
 use parquet::arrow::parquet_to_arrow_schema;
 use parquet::file::footer::{decode_footer, decode_metadata};
@@ -151,6 +152,8 @@ impl FileFormat for ParquetFormat {
         store: &Arc<dyn ObjectStore>,
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
+        info!("Inferring schema for {objects:?}");
+
         let mut schemas = Vec::with_capacity(objects.len());
         for object in objects {
             let schema =
