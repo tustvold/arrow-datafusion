@@ -16,8 +16,8 @@
 # under the License.
 
 notifications:
-  commits:      commits@arrow.apache.org
-  issues:       github@arrow.apache.org
+  commits: commits@arrow.apache.org
+  issues: github@arrow.apache.org
   pullrequests: github@arrow.apache.org
   jira_options: link label worklog
 github:
@@ -36,6 +36,8 @@ github:
   enabled_merge_buttons:
     squash: true
     merge: false
-    rebase: false    
+    rebase: false
   features:
-    issues: true        
+    issues: true
+  protected_branches:
+    main: { }
