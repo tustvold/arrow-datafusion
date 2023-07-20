@@ -42,8 +42,8 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
         Self {
             data_type,
-            map: RawTable::with_capacity(1024),
-            values: Vec::with_capacity(1024),
+            map: RawTable::with_capacity(128),
+            values: Vec::with_capacity(128),
             null_group: None,
             random_state: Default::default(),
         }
