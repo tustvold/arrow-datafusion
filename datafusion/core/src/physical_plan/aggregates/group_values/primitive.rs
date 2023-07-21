@@ -38,8 +38,14 @@ trait HashValue {
 macro_rules! hash_integer {
     ($($t:ty),+) => {
         $(impl HashValue for $t {
+            #[cfg(not(feature = "force_hash_collisions"))]
             fn hash(self, state: &RandomState) -> u64 {
                 state.hash_one(self)
+            }
+
+            #[cfg(feature = "force_hash_collisions")]
+            fn hash(self, _state: &RandomState) -> u64 {
+                0
             }
         })+
     };
@@ -50,8 +56,14 @@ hash_integer!(u8, u16, u32, u64);
 macro_rules! hash_float {
     ($($t:ty),+) => {
         $(impl HashValue for $t {
+            #[cfg(not(feature = "force_hash_collisions"))]
             fn hash(self, state: &RandomState) -> u64 {
                 state.hash_one(self.to_bits())
+            }
+
+            #[cfg(feature = "force_hash_collisions")]
+            fn hash(self, _state: &RandomState) -> u64 {
+                0
             }
         })+
     };
@@ -59,7 +71,10 @@ macro_rules! hash_float {
 
 hash_float!(f16, f32, f64);
 
-/// A [`GroupValues`] storing raw primitive values
+/// A [`GroupValues`] storing a single column of primitive values
+///
+/// This specialization is significantly faster than using the more general
+/// purpose `Row`s format
 pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     /// The data type of the output array
     data_type: DataType,
