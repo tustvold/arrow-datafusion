@@ -79,7 +79,7 @@ pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     /// The data type of the output array
     data_type: DataType,
     /// Stores the group index based on the hash of its value
-    map: RawTable<usize>,
+    map: RawTable<(u64, usize)>,
     /// The group index of the null value if any
     null_group: Option<usize>,
     /// The values for each group index
@@ -121,17 +121,17 @@ where
                     let hash = key.hash(state);
                     let insert = self.map.find_or_find_insert_slot(
                         hash,
-                        |g| unsafe { self.values.get_unchecked(*g).is_eq(key) },
-                        |g| unsafe { self.values.get_unchecked(*g).hash(state) },
+                        |(_, g)| unsafe { self.values.get_unchecked(*g).is_eq(key) },
+                        |(hash, _)| *hash,
                     );
 
                     // SAFETY: No mutation occurred since find_or_find_insert_slot
                     unsafe {
                         match insert {
-                            Ok(v) => *v.as_ref(),
+                            Ok(v) => v.as_ref().1,
                             Err(slot) => {
                                 let g = self.values.len();
-                                self.map.insert_in_slot(hash, slot, g);
+                                self.map.insert_in_slot(hash, slot, (hash, g));
                                 self.values.push(key);
                                 g
                             }
@@ -180,9 +180,9 @@ where
                 unsafe {
                     for bucket in self.map.iter() {
                         // Decrement group index by n
-                        match bucket.as_ref().checked_sub(n) {
+                        match bucket.as_ref().1.checked_sub(n) {
                             // Group index was >= n, shift value down
-                            Some(sub) => *bucket.as_mut() = sub,
+                            Some(sub) => bucket.as_mut().1 = sub,
                             // Group index was < n, so remove from table
                             None => self.map.erase(bucket),
                         }
